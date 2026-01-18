@@ -8,6 +8,10 @@
  * - Multishot accept + multishot recv with provided buffers
  * - Zero mallocs in hot path
  * - Zero context switches in steady state
+ *
+ * Build:
+ *   Production: gcc -DNDEBUG -O3 ...
+ *   Debug:      gcc -DDEBUG -O0 -g ...
  */
 
 #define _GNU_SOURCE
@@ -22,6 +26,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sched.h>
+#include <limits.h>
 
 #include <signal.h>
 #include <sys/mman.h>
@@ -33,6 +38,45 @@
 #include <linux/io_uring.h>
 #include <linux/time_types.h>
 
+/* Socket command definitions for async setsockopt (kernel 6.7+) */
+#ifndef SOCKET_URING_OP_SETSOCKOPT
+#define SOCKET_URING_OP_SETSOCKOPT 0
+#endif
+
+#ifndef IORING_OP_URING_CMD
+#define IORING_OP_URING_CMD 46
+#endif
+
+/* ============================================================================
+ * Debug/Logging macros - compiled out in production (NDEBUG)
+ * ============================================================================ */
+
+#ifdef DEBUG
+  #define LOG_INFO(fmt, ...)  fprintf(stderr, "[INFO] " fmt "\n", ##__VA_ARGS__)
+  #define LOG_WARN(fmt, ...)  fprintf(stderr, "[WARN] " fmt "\n", ##__VA_ARGS__)
+  #define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
+  #define LOG_BUG(fmt, ...)   fprintf(stderr, "[BUG] " fmt "\n", ##__VA_ARGS__)
+  #define DEBUG_ONLY(x)       x
+#else
+  #define LOG_INFO(fmt, ...)  ((void)0)
+  #define LOG_WARN(fmt, ...)  ((void)0)
+  #define LOG_ERROR(fmt, ...) ((void)0)
+  #define LOG_BUG(fmt, ...)   ((void)0)
+  #define DEBUG_ONLY(x)       ((void)0)
+#endif
+
+/* Fatal errors that should crash even in production */
+#define LOG_FATAL(fmt, ...) do { \
+    fprintf(stderr, "[FATAL] " fmt "\n", ##__VA_ARGS__); \
+} while(0)
+
+/* Branch prediction hints */
+#define likely(x)   __builtin_expect(!!(x), 1)
+#define unlikely(x) __builtin_expect(!!(x), 0)
+
+/* Prefetch for read */
+#define prefetch_r(addr) __builtin_prefetch((addr), 0, 3)
+
 /* ============================================================================
  * Configuration - All tunable at compile time
  * ============================================================================ */
@@ -41,8 +85,17 @@
 #define CQ_ENTRIES          (SQ_ENTRIES * 4)    /* 4x SQ per CLAUDE.md */
 #define NUM_BUFFERS         4096
 #define BUFFER_SIZE         2048
+#define BUFFER_SHIFT        11                   /* log2(BUFFER_SIZE) */
 #define BUFFER_GROUP_ID     0
 #define LISTEN_BACKLOG      4096
+#define MAX_CONNECTIONS     65536
+
+/* Compile-time validation */
+_Static_assert((NUM_BUFFERS & (NUM_BUFFERS - 1)) == 0, "NUM_BUFFERS must be power of 2");
+_Static_assert(NUM_BUFFERS <= 32768, "NUM_BUFFERS max is 32768");
+_Static_assert(BUFFER_SIZE >= 64, "BUFFER_SIZE too small");
+_Static_assert((1 << BUFFER_SHIFT) == BUFFER_SIZE, "BUFFER_SHIFT must match BUFFER_SIZE");
+_Static_assert(SQ_ENTRIES >= 256, "SQ_ENTRIES too small");
 
 /* HTTP response - precomputed at compile time */
 static const char HTTP_200_RESPONSE[] =
@@ -60,69 +113,83 @@ static const char HTTP_200_RESPONSE[] =
  * ============================================================================ */
 
 static inline int io_uring_setup(unsigned entries, struct io_uring_params *p) {
-    return syscall(__NR_io_uring_setup, entries, p);
-}
-
-static inline int io_uring_enter(int fd, unsigned to_submit, unsigned min_complete,
-                                  unsigned flags, sigset_t *sig) {
-    return syscall(__NR_io_uring_enter, fd, to_submit, min_complete, flags, sig, _NSIG / 8);
-}
-
-static inline int io_uring_enter2(int fd, unsigned to_submit, unsigned min_complete,
-                                   unsigned flags, sigset_t *sig, size_t sz) {
-    return syscall(__NR_io_uring_enter, fd, to_submit, min_complete, flags, sig, sz);
+    return (int)syscall(__NR_io_uring_setup, entries, p);
 }
 
 static inline int io_uring_register(int fd, unsigned opcode, void *arg, unsigned nr_args) {
-    return syscall(__NR_io_uring_register, fd, opcode, arg, nr_args);
+    return (int)syscall(__NR_io_uring_register, fd, opcode, arg, nr_args);
 }
 
 /* ============================================================================
- * Memory barriers - x86-TSO specific (acquire/release)
+ * Memory barriers - x86-TSO optimized
+ * On x86, loads are not reordered with other loads, stores are not reordered
+ * with other stores. We only need compiler barriers + volatile for acquire/release.
  * ============================================================================ */
 
-#define smp_load_acquire(p)                                     \
-    ({                                                          \
-        typeof(*(p)) ___p = (*(volatile typeof(p))(p));         \
-        __atomic_thread_fence(__ATOMIC_ACQUIRE);                \
-        ___p;                                                   \
-    })
-
-#define smp_store_release(p, v)                                 \
-    do {                                                        \
-        __atomic_thread_fence(__ATOMIC_RELEASE);                \
-        (*(volatile typeof(p))(p)) = (v);                       \
-    } while (0)
+#if defined(__x86_64__) || defined(__i386__)
+  /* x86 has strong memory model - compiler barrier is sufficient */
+  #define smp_load_acquire(p) ({              \
+      typeof(*(p)) ___v = *(volatile typeof(*(p)) *)(p); \
+      __asm__ __volatile__("" ::: "memory");  \
+      ___v;                                   \
+  })
+  #define smp_store_release(p, v) do {        \
+      __asm__ __volatile__("" ::: "memory");  \
+      *(volatile typeof(*(p)) *)(p) = (v);    \
+  } while (0)
+#else
+  /* Generic - use full atomic fences */
+  #define smp_load_acquire(p) ({                              \
+      typeof(*(p)) ___v = *(volatile typeof(*(p)) *)(p);      \
+      __atomic_thread_fence(__ATOMIC_ACQUIRE);                \
+      ___v;                                                   \
+  })
+  #define smp_store_release(p, v) do {                        \
+      __atomic_thread_fence(__ATOMIC_RELEASE);                \
+      *(volatile typeof(*(p)) *)(p) = (v);                    \
+  } while (0)
+#endif
 
 /* ============================================================================
- * Ring structures - direct kernel interface
+ * Ring structures - cache-line optimized layout
  * ============================================================================ */
 
 struct uring_sq {
-    uint32_t *khead;
-    uint32_t *ktail;
-    uint32_t *kring_mask;
-    uint32_t *kring_entries;
+    /* Kernel-shared pointers - read frequently */
+    uint32_t *khead;            /* Consumer head (kernel updates) */
+    uint32_t *ktail;            /* Producer tail (we update) */
+    uint32_t *kring_mask;       /* Cached on init */
+    uint32_t *kring_entries;    /* Cached on init */
+    uint32_t *array;            /* SQE index array */
+    struct io_uring_sqe *sqes;  /* SQE array */
+
+    /* Local state - not shared with kernel */
+    uint32_t ring_mask;         /* Cached from *kring_mask */
+    uint32_t ring_entries;      /* Cached from *kring_entries */
+    uint32_t sqe_head;          /* Our head for tracking submissions */
+    uint32_t sqe_tail;          /* Our tail for tracking submissions */
+
+    /* Init-time only */
     uint32_t *kflags;
     uint32_t *kdropped;
-    uint32_t *array;
-    struct io_uring_sqe *sqes;
-
-    uint32_t sqe_head;
-    uint32_t sqe_tail;
     size_t ring_sz;
     void *ring_ptr;
 };
 
 struct uring_cq {
-    uint32_t *khead;
-    uint32_t *ktail;
+    /* Kernel-shared pointers */
+    uint32_t *khead;            /* Consumer head (we update) */
+    uint32_t *ktail;            /* Producer tail (kernel updates) */
+    struct io_uring_cqe *cqes;  /* CQE array */
+
+    /* Cached values */
+    uint32_t ring_mask;
+
+    /* Init-time only */
     uint32_t *kring_mask;
     uint32_t *kring_entries;
     uint32_t *kflags;
     uint32_t *koverflow;
-    struct io_uring_cqe *cqes;
-
     size_t ring_sz;
     void *ring_ptr;
 };
@@ -130,55 +197,89 @@ struct uring_cq {
 struct uring {
     struct uring_sq sq;
     struct uring_cq cq;
-    uint32_t flags;
     int ring_fd;
     uint32_t features;
-    int enter_ring_fd;
-    uint32_t pad[2];
 };
 
-/* Provided buffer ring */
+/* Provided buffer ring - optimized layout */
 struct buf_ring {
     struct io_uring_buf_ring *br;
     uint8_t *buf_base;
-    uint32_t buf_cnt;
-    uint32_t buf_len;
     uint16_t tail;
-    uint16_t bgid;
+    uint16_t mask;              /* NUM_BUFFERS - 1, cached */
 };
+
+/* ============================================================================
+ * Connection state - bit-packed for cache efficiency
+ * ============================================================================ */
+
+struct conn_state {
+    uint8_t closing : 1;
+    uint8_t recv_active : 1;
+    uint8_t reserved : 6;
+};
+
+static struct conn_state g_conns[MAX_CONNECTIONS];
+
+/* Static value for async setsockopt - must persist across async operation */
+static int g_tcp_nodelay_val = 1;
+
+static inline struct conn_state *get_conn(int fd) {
+    /* Branchless bounds check - returns NULL for invalid fd */
+    unsigned ufd = (unsigned)fd;
+    return (ufd < MAX_CONNECTIONS) ? &g_conns[ufd] : NULL;
+}
 
 /* ============================================================================
  * Context encoding - pack into 64-bit user_data
- * Layout: [fd:32][op:8][buf_idx:16][flags:8]
+ * Layout: [fd:32][op:8][buf_idx:16][unused:8]
  * ============================================================================ */
 
 enum op_type {
-    OP_ACCEPT   = 0,
-    OP_RECV     = 1,
-    OP_SEND     = 2,
-    OP_CLOSE    = 3,
+    OP_ACCEPT     = 0,
+    OP_RECV       = 1,
+    OP_SEND       = 2,
+    OP_CLOSE      = 3,
+    OP_SETSOCKOPT = 4,
 };
 
-static inline uint64_t encode_user_data(int32_t fd, uint8_t op, uint16_t buf_idx) {
-    return ((uint64_t)(uint32_t)fd) |
-           ((uint64_t)op << 32) |
-           ((uint64_t)buf_idx << 40);
+/* Pre-shifted operation codes for faster encoding */
+#define OP_ACCEPT_SHIFTED     ((uint64_t)OP_ACCEPT << 32)
+#define OP_RECV_SHIFTED       ((uint64_t)OP_RECV << 32)
+#define OP_SEND_SHIFTED       ((uint64_t)OP_SEND << 32)
+#define OP_CLOSE_SHIFTED      ((uint64_t)OP_CLOSE << 32)
+#define OP_SETSOCKOPT_SHIFTED ((uint64_t)OP_SETSOCKOPT << 32)
+
+static inline uint64_t encode_accept(void) {
+    return OP_ACCEPT_SHIFTED | 0xFFFFFFFF; /* fd = -1 */
 }
 
-static inline int32_t decode_fd(uint64_t user_data) {
-    return (int32_t)(user_data & 0xFFFFFFFF);
+static inline uint64_t encode_recv(int fd) {
+    return OP_RECV_SHIFTED | (uint32_t)fd;
 }
 
-static inline uint8_t decode_op(uint64_t user_data) {
-    return (uint8_t)((user_data >> 32) & 0xFF);
+static inline uint64_t encode_send(int fd, uint16_t buf_idx) {
+    return OP_SEND_SHIFTED | (uint32_t)fd | ((uint64_t)buf_idx << 40);
 }
 
-static inline uint16_t decode_buf_idx(uint64_t user_data) {
-    return (uint16_t)((user_data >> 40) & 0xFFFF);
+static inline uint64_t encode_close(int fd) {
+    return OP_CLOSE_SHIFTED | (uint32_t)fd;
+}
+
+static inline int32_t decode_fd(uint64_t ud) {
+    return (int32_t)(ud & 0xFFFFFFFF);
+}
+
+static inline uint8_t decode_op(uint64_t ud) {
+    return (uint8_t)(ud >> 32);
+}
+
+static inline uint16_t decode_buf_idx(uint64_t ud) {
+    return (uint16_t)(ud >> 40);
 }
 
 /* ============================================================================
- * io_uring initialization - raw setup without liburing
+ * io_uring initialization
  * ============================================================================ */
 
 static int uring_mmap(struct uring *ring, struct io_uring_params *p) {
@@ -193,10 +294,10 @@ static int uring_mmap(struct uring *ring, struct io_uring_params *p) {
     sq->ring_ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
                         MAP_SHARED | MAP_POPULATE, ring->ring_fd,
                         IORING_OFF_SQ_RING);
-    if (sq->ring_ptr == MAP_FAILED)
+    if (unlikely(sq->ring_ptr == MAP_FAILED))
         return -errno;
 
-    /* CQ ring mapping - may share with SQ or be separate */
+    /* CQ ring mapping */
     if (p->features & IORING_FEAT_SINGLE_MMAP) {
         cq->ring_ptr = sq->ring_ptr;
         cq->ring_sz = 0;
@@ -206,7 +307,7 @@ static int uring_mmap(struct uring *ring, struct io_uring_params *p) {
         cq->ring_ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
                             MAP_SHARED | MAP_POPULATE, ring->ring_fd,
                             IORING_OFF_CQ_RING);
-        if (cq->ring_ptr == MAP_FAILED) {
+        if (unlikely(cq->ring_ptr == MAP_FAILED)) {
             ret = -errno;
             munmap(sq->ring_ptr, sq->ring_sz);
             return ret;
@@ -218,7 +319,7 @@ static int uring_mmap(struct uring *ring, struct io_uring_params *p) {
     sq->sqes = mmap(NULL, size, PROT_READ | PROT_WRITE,
                     MAP_SHARED | MAP_POPULATE, ring->ring_fd,
                     IORING_OFF_SQES);
-    if (sq->sqes == MAP_FAILED) {
+    if (unlikely(sq->sqes == MAP_FAILED)) {
         ret = -errno;
         if (cq->ring_sz)
             munmap(cq->ring_ptr, cq->ring_sz);
@@ -235,6 +336,10 @@ static int uring_mmap(struct uring *ring, struct io_uring_params *p) {
     sq->kdropped = sq->ring_ptr + p->sq_off.dropped;
     sq->array = sq->ring_ptr + p->sq_off.array;
 
+    /* Cache frequently-used values */
+    sq->ring_mask = *sq->kring_mask;
+    sq->ring_entries = *sq->kring_entries;
+
     /* Setup CQ pointers */
     cq->khead = cq->ring_ptr + p->cq_off.head;
     cq->ktail = cq->ring_ptr + p->cq_off.tail;
@@ -243,6 +348,9 @@ static int uring_mmap(struct uring *ring, struct io_uring_params *p) {
     cq->kflags = cq->ring_ptr + p->cq_off.flags;
     cq->koverflow = cq->ring_ptr + p->cq_off.overflow;
     cq->cqes = cq->ring_ptr + p->cq_off.cqes;
+
+    /* Cache ring mask */
+    cq->ring_mask = *cq->kring_mask;
 
     return 0;
 }
@@ -254,14 +362,6 @@ static int uring_init(struct uring *ring) {
     memset(&p, 0, sizeof(p));
     memset(ring, 0, sizeof(*ring));
 
-    /*
-     * Flags per CLAUDE.md:
-     * - SUBMIT_ALL: All-or-nothing submission
-     * - SINGLE_ISSUER: Skip submission locking (single-threaded)
-     * - DEFER_TASKRUN: Batch completions, run on submit_and_wait
-     * - COOP_TASKRUN: No async TWA interrupts
-     * - CQSIZE: 4x SQ depth
-     */
     p.flags = IORING_SETUP_SUBMIT_ALL |
               IORING_SETUP_SINGLE_ISSUER |
               IORING_SETUP_DEFER_TASKRUN |
@@ -270,15 +370,13 @@ static int uring_init(struct uring *ring) {
     p.cq_entries = CQ_ENTRIES;
 
     ring->ring_fd = io_uring_setup(SQ_ENTRIES, &p);
-    if (ring->ring_fd < 0)
+    if (unlikely(ring->ring_fd < 0))
         return -errno;
 
     ring->features = p.features;
-    ring->flags = p.flags;
-    ring->enter_ring_fd = ring->ring_fd;
 
     ret = uring_mmap(ring, &p);
-    if (ret < 0) {
+    if (unlikely(ret < 0)) {
         close(ring->ring_fd);
         return ret;
     }
@@ -287,7 +385,7 @@ static int uring_init(struct uring *ring) {
 }
 
 /* ============================================================================
- * SQE acquisition and submission - direct ring manipulation
+ * SQE acquisition - OPTIMIZED: no memset, minimal work
  * ============================================================================ */
 
 static inline struct io_uring_sqe *uring_get_sqe(struct uring *ring) {
@@ -295,250 +393,264 @@ static inline struct io_uring_sqe *uring_get_sqe(struct uring *ring) {
     uint32_t head = smp_load_acquire(sq->khead);
     uint32_t next = sq->sqe_tail + 1;
 
-    if (next - head > *sq->kring_entries)
+    /* Check if SQ is full */
+    if (unlikely(next - head > sq->ring_entries))
         return NULL;
 
-    struct io_uring_sqe *sqe = &sq->sqes[sq->sqe_tail & *sq->kring_mask];
+    struct io_uring_sqe *sqe = &sq->sqes[sq->sqe_tail & sq->ring_mask];
     sq->sqe_tail = next;
 
-    /* Clear the SQE - critical for correct operation */
-    memset(sqe, 0, sizeof(*sqe));
-
+    /* NO MEMSET - caller must initialize all required fields */
     return sqe;
-}
-
-static inline void uring_sqe_set_data64(struct io_uring_sqe *sqe, uint64_t data) {
-    sqe->user_data = data;
 }
 
 static inline int uring_submit(struct uring *ring) {
     struct uring_sq *sq = &ring->sq;
-    uint32_t submitted = sq->sqe_tail - sq->sqe_head;
+    uint32_t to_submit = sq->sqe_tail - sq->sqe_head;
 
-    if (!submitted)
+    if (!to_submit)
         return 0;
 
     /* Fill SQ array with SQE indices */
-    uint32_t mask = *sq->kring_mask;
+    uint32_t mask = sq->ring_mask;
     uint32_t ktail = *sq->ktail;
+    uint32_t i = sq->sqe_head;
 
-    for (uint32_t i = sq->sqe_head; i != sq->sqe_tail; i++) {
+    /* Unrolled loop for common case */
+    while (i != sq->sqe_tail) {
         sq->array[ktail & mask] = i & mask;
         ktail++;
+        i++;
     }
 
     smp_store_release(sq->ktail, ktail);
     sq->sqe_head = sq->sqe_tail;
 
-    return submitted;
+    return (int)to_submit;
 }
 
-static inline int uring_submit_and_wait_timeout(struct uring *ring,
-                                                  struct io_uring_cqe **cqe_ptr __attribute__((unused)),
-                                                  unsigned wait_nr,
-                                                  struct __kernel_timespec *ts) {
-    int submitted = uring_submit(ring);
+static inline int uring_submit_and_wait(struct uring *ring,
+                                         unsigned wait_nr,
+                                         struct __kernel_timespec *ts) {
+    int to_submit = uring_submit(ring);
     unsigned flags = IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG;
 
-    struct io_uring_getevents_arg arg = {
-        .sigmask = 0,
-        .sigmask_sz = _NSIG / 8,
-        .ts = (uint64_t)ts
-    };
+    /* Zero-initialize to avoid kernel reading garbage padding */
+    struct io_uring_getevents_arg arg;
+    memset(&arg, 0, sizeof(arg));
+    arg.sigmask_sz = _NSIG / 8;
+    arg.ts = (uint64_t)ts;
 
-    int ret = syscall(__NR_io_uring_enter, ring->ring_fd, submitted, wait_nr,
-                      flags, &arg, sizeof(arg));
-    if (ret < 0 && errno != ETIME)
-        return -errno;
+    long ret = syscall(__NR_io_uring_enter, ring->ring_fd, to_submit, wait_nr,
+                       flags, &arg, sizeof(arg));
 
-    return submitted >= 0 ? submitted : ret;
-}
-
-/* ============================================================================
- * CQE processing - direct ring access per CLAUDE.md
- * ============================================================================ */
-
-static inline unsigned uring_cq_ready(struct uring *ring) {
-    return smp_load_acquire(ring->cq.ktail) - *ring->cq.khead;
-}
-
-static inline struct io_uring_cqe *uring_peek_cqe(struct uring *ring) {
-    struct uring_cq *cq = &ring->cq;
-    uint32_t head = *cq->khead;
-    uint32_t tail = smp_load_acquire(cq->ktail);
-
-    if (head == tail)
-        return NULL;
-
-    return &cq->cqes[head & *cq->kring_mask];
-}
-
-static inline void uring_cq_advance(struct uring *ring, unsigned nr) {
-    if (nr) {
-        struct uring_cq *cq = &ring->cq;
-        smp_store_release(cq->khead, *cq->khead + nr);
+    if (unlikely(ret < 0)) {
+        ret = -errno;
+        if (ret != -ETIME && ret != -EINTR)
+            return (int)ret;
     }
+
+    return to_submit;
 }
 
 /* ============================================================================
- * Provided buffer ring setup
+ * Provided buffer ring
  * ============================================================================ */
 
 static int buf_ring_init(struct uring *ring, struct buf_ring *br) {
-    size_t ring_size = (sizeof(struct io_uring_buf) + BUFFER_SIZE) * NUM_BUFFERS;
+    size_t ring_entries_size = sizeof(struct io_uring_buf) * NUM_BUFFERS;
+    size_t buffers_size = (size_t)BUFFER_SIZE * NUM_BUFFERS;
+    size_t total_size = ring_entries_size + buffers_size;
 
-    /* Use huge pages if available, fall back to regular pages */
-    void *ptr = mmap(NULL, ring_size, PROT_READ | PROT_WRITE,
+    /* Try huge pages first */
+    void *ptr = mmap(NULL, total_size, PROT_READ | PROT_WRITE,
                      MAP_ANONYMOUS | MAP_PRIVATE | MAP_HUGETLB, -1, 0);
     if (ptr == MAP_FAILED) {
-        ptr = mmap(NULL, ring_size, PROT_READ | PROT_WRITE,
+        LOG_WARN("huge pages unavailable, falling back to regular pages");
+        ptr = mmap(NULL, total_size, PROT_READ | PROT_WRITE,
                    MAP_ANONYMOUS | MAP_PRIVATE | MAP_POPULATE, -1, 0);
-        if (ptr == MAP_FAILED)
+        if (unlikely(ptr == MAP_FAILED))
             return -errno;
     }
 
     br->br = ptr;
-    br->buf_base = (uint8_t *)ptr + (sizeof(struct io_uring_buf) * NUM_BUFFERS);
-    br->buf_cnt = NUM_BUFFERS;
-    br->buf_len = BUFFER_SIZE;
+    br->buf_base = (uint8_t *)ptr + ring_entries_size;
     br->tail = 0;
-    br->bgid = BUFFER_GROUP_ID;
+    br->mask = NUM_BUFFERS - 1;
 
-    /* Initialize buffer ring header */
-    br->br->tail = 0;
-
-    /* Add all buffers to the ring */
+    /* Initialize buffer entries using pointer arithmetic (no multiplication) */
+    uint8_t *buf_ptr = br->buf_base;
     for (uint32_t i = 0; i < NUM_BUFFERS; i++) {
-        struct io_uring_buf *buf = &br->br->bufs[i];
-        buf->addr = (uint64_t)(br->buf_base + (i * BUFFER_SIZE));
+        struct io_uring_buf *buf = &br->br->bufs[br->tail & br->mask];
+        buf->addr = (uint64_t)buf_ptr;
         buf->len = BUFFER_SIZE;
-        buf->bid = i;
+        buf->bid = (uint16_t)i;
+        br->tail++;
+        buf_ptr += BUFFER_SIZE;
     }
-    br->tail = NUM_BUFFERS;
     smp_store_release(&br->br->tail, br->tail);
 
-    /* Register with kernel */
-    struct io_uring_buf_reg reg = {
-        .ring_addr = (uint64_t)br->br,
-        .ring_entries = NUM_BUFFERS,
-        .bgid = BUFFER_GROUP_ID,
-    };
+    struct io_uring_buf_reg reg;
+    memset(&reg, 0, sizeof(reg));
+    reg.ring_addr = (uint64_t)br->br;
+    reg.ring_entries = NUM_BUFFERS;
+    reg.bgid = BUFFER_GROUP_ID;
 
     int ret = io_uring_register(ring->ring_fd, IORING_REGISTER_PBUF_RING, &reg, 1);
-    if (ret < 0)
+    if (unlikely(ret < 0))
         return ret;
 
     return 0;
 }
 
-static inline void buf_ring_add(struct buf_ring *br, uint16_t bid) {
-    uint16_t tail = br->tail;
-    struct io_uring_buf *buf = &br->br->bufs[tail & (br->buf_cnt - 1)];
+/* Hot path - inline, no validation in production */
+static inline void buf_ring_recycle(struct buf_ring *br, uint16_t bid) {
+    DEBUG_ONLY(if (bid > br->mask) { LOG_BUG("invalid bid %u", bid); return; });
 
-    buf->addr = (uint64_t)(br->buf_base + (bid * br->buf_len));
-    buf->len = br->buf_len;
+    uint16_t tail = br->tail;
+    struct io_uring_buf *buf = &br->br->bufs[tail & br->mask];
+
+    /* Use shift instead of multiply */
+    buf->addr = (uint64_t)(br->buf_base + ((uint32_t)bid << BUFFER_SHIFT));
+    buf->len = BUFFER_SIZE;
     buf->bid = bid;
 
     br->tail = tail + 1;
     smp_store_release(&br->br->tail, br->tail);
 }
 
-static inline uint8_t *buf_ring_get_buf(struct buf_ring *br, uint16_t bid) {
-    return br->buf_base + (bid * br->buf_len);
-}
-
 /* ============================================================================
- * SQE preparation helpers - no liburing, direct sqe setup
+ * SQE preparation - OPTIMIZED: only set required fields, no memset
  * ============================================================================ */
 
-static inline void prep_multishot_accept(struct io_uring_sqe *sqe, int fd) {
+static inline void prep_multishot_accept_direct(struct io_uring_sqe *sqe, int fd) {
     sqe->opcode = IORING_OP_ACCEPT;
-    sqe->fd = fd;
-    sqe->addr = 0;  /* No sockaddr needed */
-    sqe->addr2 = 0;
-    sqe->accept_flags = 0;
+    sqe->flags = 0;
     sqe->ioprio = IORING_ACCEPT_MULTISHOT;
-}
-
-static inline void prep_recv_multishot(struct io_uring_sqe *sqe, int fd, uint16_t bgid) {
-    sqe->opcode = IORING_OP_RECV;
     sqe->fd = fd;
+    sqe->off = 0;
     sqe->addr = 0;
-    sqe->len = 0; /* Required for multishot */
-    sqe->msg_flags = 0;
-    sqe->ioprio = IORING_RECV_MULTISHOT;
-    sqe->flags = IOSQE_BUFFER_SELECT;
-    sqe->buf_group = bgid;
+    sqe->len = 0;
+    sqe->accept_flags = 0;
+    sqe->user_data = encode_accept();
+    sqe->buf_group = 0;
+    sqe->personality = 0;
+    sqe->splice_fd_in = 0;
+    sqe->addr3 = 0;
+    sqe->__pad2[0] = 0;
 }
 
-static inline void prep_send(struct io_uring_sqe *sqe, int fd, const void *buf,
-                              uint32_t len, int flags) {
-    sqe->opcode = IORING_OP_SEND;
+static inline void prep_recv_multishot_direct(struct io_uring_sqe *sqe, int fd) {
+    sqe->opcode = IORING_OP_RECV;
+    sqe->flags = IOSQE_BUFFER_SELECT;
+    sqe->ioprio = IORING_RECV_MULTISHOT;
     sqe->fd = fd;
+    sqe->off = 0;
+    sqe->addr = 0;
+    sqe->len = 0;  /* MUST be 0 for multishot */
+    sqe->msg_flags = 0;
+    sqe->user_data = encode_recv(fd);
+    sqe->buf_group = BUFFER_GROUP_ID;
+    sqe->personality = 0;
+    sqe->splice_fd_in = 0;
+    sqe->addr3 = 0;
+    sqe->__pad2[0] = 0;
+}
+
+static inline void prep_send_direct(struct io_uring_sqe *sqe, int fd,
+                                     const void *buf, uint32_t len,
+                                     uint16_t buf_idx) {
+    sqe->opcode = IORING_OP_SEND;
+    sqe->flags = 0;
+    sqe->ioprio = 0;
+    sqe->fd = fd;
+    sqe->off = 0;
     sqe->addr = (uint64_t)buf;
     sqe->len = len;
-    sqe->msg_flags = flags;
+    sqe->msg_flags = 0;
+    sqe->user_data = encode_send(fd, buf_idx);
+    sqe->buf_group = 0;
+    sqe->personality = 0;
+    sqe->splice_fd_in = 0;
+    sqe->addr3 = 0;
+    sqe->__pad2[0] = 0;
 }
 
-static inline void prep_close(struct io_uring_sqe *sqe, int fd) {
+static inline void prep_close_direct(struct io_uring_sqe *sqe, int fd) {
     sqe->opcode = IORING_OP_CLOSE;
+    sqe->flags = 0;
+    sqe->ioprio = 0;
     sqe->fd = fd;
+    sqe->off = 0;
+    sqe->addr = 0;
+    sqe->len = 0;
+    sqe->rw_flags = 0;
+    sqe->user_data = encode_close(fd);
+    sqe->buf_group = 0;
+    sqe->personality = 0;
+    sqe->splice_fd_in = 0;
+    sqe->addr3 = 0;
+    sqe->__pad2[0] = 0;
+}
+
+static inline void prep_setsockopt_direct(struct io_uring_sqe *sqe, int fd,
+                                           int level, int optname,
+                                           void *optval, int optlen) {
+    sqe->opcode = IORING_OP_URING_CMD;
+    sqe->flags = 0;
+    sqe->ioprio = 0;
+    sqe->fd = fd;
+    sqe->off = 0;  /* cmd_op = SOCKET_URING_OP_SETSOCKOPT (0) */
+    sqe->addr = 0;
+    sqe->len = 0;
+    sqe->rw_flags = 0;
+    sqe->user_data = OP_SETSOCKOPT_SHIFTED | (uint32_t)fd;
+    sqe->buf_group = 0;
+    sqe->personality = 0;
+    sqe->splice_fd_in = 0;
+    sqe->addr3 = 0;
+    sqe->__pad2[0] = 0;
+
+    /* Socket command parameters in cmd array (offset 48 in SQE)
+     * Layout: level(4) | optname(4) | optlen(4) | pad(4) | optval(8) */
+    uint8_t *cmd = (uint8_t *)sqe + 48;
+    *(uint32_t *)(cmd + 0) = (uint32_t)level;
+    *(uint32_t *)(cmd + 4) = (uint32_t)optname;
+    *(uint32_t *)(cmd + 8) = (uint32_t)optlen;
+    *(uint32_t *)(cmd + 12) = 0;  /* padding */
+    *(uint64_t *)(cmd + 16) = (uint64_t)(uintptr_t)optval;
 }
 
 /* ============================================================================
- * Listening socket setup
+ * Listening socket setup (startup path - not performance critical)
  * ============================================================================ */
 
 static int create_listen_socket(int port, int cpu) {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (fd < 0) {
-        perror("socket");
+        LOG_FATAL("socket: %s", strerror(errno));
         return -1;
     }
 
     int opt = 1;
-
-    /* SO_REUSEADDR - allow rapid restart */
-    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        perror("SO_REUSEADDR");
-        close(fd);
-        return -1;
-    }
-
-    /* SO_REUSEPORT - allow multiple listeners for load balancing */
-    if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0) {
-        perror("SO_REUSEPORT");
-        close(fd);
-        return -1;
-    }
-
-    /* SO_INCOMING_CPU - route packets to specific CPU (per CLAUDE.md) */
-    if (setsockopt(fd, SOL_SOCKET, SO_INCOMING_CPU, &cpu, sizeof(cpu)) < 0) {
-        /* Non-fatal - might not be supported */
-        fprintf(stderr, "Warning: SO_INCOMING_CPU not supported\n");
-    }
-
-    /* TCP_NODELAY - disable Nagle (per CLAUDE.md) */
-    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {
-        perror("TCP_NODELAY");
-        close(fd);
-        return -1;
-    }
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+    setsockopt(fd, SOL_SOCKET, SO_INCOMING_CPU, &cpu, sizeof(cpu));
 
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
-        .sin_port = htons(port),
+        .sin_port = htons((uint16_t)port),
         .sin_addr.s_addr = htonl(INADDR_ANY),
     };
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind");
+        LOG_FATAL("bind: %s", strerror(errno));
         close(fd);
         return -1;
     }
 
     if (listen(fd, LISTEN_BACKLOG) < 0) {
-        perror("listen");
+        LOG_FATAL("listen: %s", strerror(errno));
         close(fd);
         return -1;
     }
@@ -547,212 +659,335 @@ static int create_listen_socket(int port, int cpu) {
 }
 
 /* ============================================================================
- * CPU affinity setup (per CLAUDE.md)
+ * CPU affinity (startup path)
  * ============================================================================ */
 
 static int set_cpu_affinity(int cpu) {
+    if (cpu < 0 || cpu >= CPU_SETSIZE)
+        return -1;
+
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(cpu, &cpuset);
 
-    if (sched_setaffinity(0, sizeof(cpuset), &cpuset) < 0) {
-        perror("sched_setaffinity");
-        return -1;
-    }
-
-    return 0;
+    return sched_setaffinity(0, sizeof(cpuset), &cpuset);
 }
 
 /* ============================================================================
- * Event handlers
+ * Server context
  * ============================================================================ */
 
 struct server_ctx {
     struct uring ring;
     struct buf_ring br;
     int listen_fd;
-    volatile bool running;
+    sig_atomic_t running;  /* Proper type for signal handlers */
 };
 
-static void add_accept(struct server_ctx *ctx) {
-    struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
-    if (!sqe) {
-        fprintf(stderr, "SQ full on accept\n");
-        return;
-    }
+static struct server_ctx *g_ctx = NULL;
 
-    prep_multishot_accept(sqe, ctx->listen_fd);
-    uring_sqe_set_data64(sqe, encode_user_data(-1, OP_ACCEPT, 0));
-}
-
-static void add_recv(struct server_ctx *ctx, int client_fd) {
-    struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
-    if (!sqe) {
-        fprintf(stderr, "SQ full on recv\n");
-        return;
-    }
-
-    prep_recv_multishot(sqe, client_fd, BUFFER_GROUP_ID);
-    uring_sqe_set_data64(sqe, encode_user_data(client_fd, OP_RECV, 0));
-}
-
-static void add_send(struct server_ctx *ctx, int client_fd, const void *data,
-                     uint32_t len, uint16_t buf_idx) {
-    struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
-    if (!sqe) {
-        fprintf(stderr, "SQ full on send\n");
-        return;
-    }
-
-    prep_send(sqe, client_fd, data, len, 0);
-    uring_sqe_set_data64(sqe, encode_user_data(client_fd, OP_SEND, buf_idx));
-}
-
-static void add_close(struct server_ctx *ctx, int client_fd) {
-    struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
-    if (!sqe) {
-        fprintf(stderr, "SQ full on close\n");
-        return;
-    }
-
-    prep_close(sqe, client_fd);
-    uring_sqe_set_data64(sqe, encode_user_data(client_fd, OP_CLOSE, 0));
-}
-
-static void handle_accept(struct server_ctx *ctx, struct io_uring_cqe *cqe) {
-    int client_fd = cqe->res;
-
-    if (client_fd >= 0) {
-        /* Set TCP_NODELAY on new connection */
-        int opt = 1;
-        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-
-        /* Start receiving on this connection */
-        add_recv(ctx, client_fd);
-    } else if (client_fd != -EAGAIN && client_fd != -EWOULDBLOCK) {
-        fprintf(stderr, "Accept error: %d\n", client_fd);
-    }
-
-    /* Rearm accept if multishot ended */
-    if (!(cqe->flags & IORING_CQE_F_MORE)) {
-        add_accept(ctx);
-    }
-}
-
-static void handle_recv(struct server_ctx *ctx, struct io_uring_cqe *cqe, int client_fd) {
-    int res = cqe->res;
-
-    if (res <= 0) {
-        /* EOF, error, or connection closed */
-        if (res == 0 || res == -ECONNRESET || res == -EBADF || res == -EPIPE) {
-            add_close(ctx, client_fd);
-        } else if (res == -ENOBUFS) {
-            /* No buffers available - multishot will retry automatically */
-        } else {
-            fprintf(stderr, "Recv error %d on fd %d\n", res, client_fd);
-            add_close(ctx, client_fd);
-        }
-        return;
-    }
-
-    /* Got data - check for buffer flag */
-    if (!(cqe->flags & IORING_CQE_F_BUFFER)) {
-        fprintf(stderr, "No buffer flag on recv\n");
-        add_close(ctx, client_fd);
-        return;
-    }
-
-    uint16_t buf_idx = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
-
-    /* Send HTTP 200 response */
-    add_send(ctx, client_fd, HTTP_200_RESPONSE, HTTP_200_LEN, buf_idx);
-
-    /* Rearm recv if multishot ended */
-    if (!(cqe->flags & IORING_CQE_F_MORE)) {
-        add_recv(ctx, client_fd);
-    }
-}
-
-static void handle_send(struct server_ctx *ctx, struct io_uring_cqe *cqe,
-                        int client_fd, uint16_t buf_idx) {
-    int res = cqe->res;
-
-    /* Recycle buffer back to ring */
-    buf_ring_add(&ctx->br, buf_idx);
-
-    if (res < 0) {
-        if (res == -EPIPE || res == -ECONNRESET || res == -EBADF) {
-            add_close(ctx, client_fd);
-        } else {
-            fprintf(stderr, "Send error %d on fd %d\n", res, client_fd);
-        }
-    }
-    /* Connection stays open for keep-alive */
+static void signal_handler(int sig) {
+    (void)sig;
+    if (g_ctx)
+        g_ctx->running = 0;
 }
 
 /* ============================================================================
- * Main event loop - per CLAUDE.md architecture
- *
- * "Single-syscall submit/wait pattern"
- * "CQ drain via direct ring access"
+ * Event handlers - HOT PATH, maximally optimized
  * ============================================================================ */
+
+static inline bool queue_accept(struct server_ctx *ctx) {
+    struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
+    if (unlikely(!sqe)) {
+        LOG_ERROR("SQ full on accept");
+        return false;
+    }
+    prep_multishot_accept_direct(sqe, ctx->listen_fd);
+    return true;
+}
+
+static inline bool queue_recv(struct server_ctx *ctx, int fd) {
+    struct conn_state *c = get_conn(fd);
+    if (unlikely(!c) || c->closing)
+        return false;
+
+    struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
+    if (unlikely(!sqe)) {
+        LOG_ERROR("SQ full on recv fd=%d", fd);
+        return false;
+    }
+    prep_recv_multishot_direct(sqe, fd);
+    c->recv_active = 1;
+    return true;
+}
+
+static inline bool queue_send(struct server_ctx *ctx, int fd, uint16_t buf_idx) {
+    struct conn_state *c = get_conn(fd);
+    if (unlikely(!c) || c->closing) {
+        buf_ring_recycle(&ctx->br, buf_idx);
+        return false;
+    }
+
+    struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
+    if (unlikely(!sqe)) {
+        LOG_ERROR("SQ full on send fd=%d", fd);
+        buf_ring_recycle(&ctx->br, buf_idx);
+        return false;
+    }
+    prep_send_direct(sqe, fd, HTTP_200_RESPONSE, HTTP_200_LEN, buf_idx);
+    return true;
+}
+
+static inline bool queue_close(struct server_ctx *ctx, int fd) {
+    struct conn_state *c = get_conn(fd);
+    if (unlikely(!c))
+        return false;
+
+    if (c->closing)
+        return true;  /* Already queued */
+
+    struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
+    if (unlikely(!sqe)) {
+        LOG_ERROR("SQ full on close fd=%d", fd);
+        c->closing = 1;  /* Mark to prevent further ops */
+        return false;
+    }
+    prep_close_direct(sqe, fd);
+    c->closing = 1;
+    return true;
+}
+
+static inline bool queue_setsockopt_nodelay(struct server_ctx *ctx, int fd) {
+    struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
+    if (unlikely(!sqe)) {
+        LOG_WARN("SQ full on setsockopt fd=%d", fd);
+        return false;
+    }
+    prep_setsockopt_direct(sqe, fd, IPPROTO_TCP, TCP_NODELAY,
+                           &g_tcp_nodelay_val, sizeof(g_tcp_nodelay_val));
+    return true;
+}
+
+static inline void handle_setsockopt(struct server_ctx *ctx,
+                                      struct io_uring_cqe *cqe, int fd) {
+    (void)ctx; (void)fd;
+    if (unlikely(cqe->res < 0)) {
+        LOG_WARN("setsockopt failed fd=%d res=%d", fd, cqe->res);
+    }
+    /* TCP_NODELAY failure is non-fatal, connection proceeds */
+}
+
+static inline void handle_accept(struct server_ctx *ctx, struct io_uring_cqe *cqe) {
+    int fd = cqe->res;
+
+    if (likely(fd >= 0)) {
+        struct conn_state *c = get_conn(fd);
+        if (likely(c)) {
+            c->closing = 0;
+            c->recv_active = 0;
+
+            /* Async TCP_NODELAY via io_uring - no syscall in hot path! */
+            queue_setsockopt_nodelay(ctx, fd);
+
+            if (unlikely(!queue_recv(ctx, fd))) {
+                queue_close(ctx, fd);  /* Async close */
+            }
+        } else {
+            queue_close(ctx, fd);  /* Async close */
+        }
+    } else if (fd != -EAGAIN && fd != -EWOULDBLOCK && fd != -ECANCELED) {
+        LOG_ERROR("accept error: %d", fd);
+    }
+
+    if (unlikely(!(cqe->flags & IORING_CQE_F_MORE))) {
+        if (!queue_accept(ctx)) {
+            LOG_FATAL("Cannot rearm accept");
+            ctx->running = 0;
+        }
+    }
+}
+
+static inline void handle_recv(struct server_ctx *ctx, struct io_uring_cqe *cqe, int fd) {
+    struct conn_state *c = get_conn(fd);
+    int res = cqe->res;
+    bool more = (cqe->flags & IORING_CQE_F_MORE) != 0;
+
+    if (!more && c)
+        c->recv_active = 0;
+
+    if (unlikely(res <= 0)) {
+        if (res == 0 || res == -ECONNRESET || res == -EBADF ||
+            res == -EPIPE || res == -ECANCELED) {
+            queue_close(ctx, fd);
+        } else if (res == -ENOBUFS) {
+            LOG_WARN("ENOBUFS fd=%d", fd);
+            if (!more && c && !c->closing)
+                queue_recv(ctx, fd);
+        } else {
+            LOG_ERROR("recv error %d fd=%d", res, fd);
+            queue_close(ctx, fd);
+        }
+        return;
+    }
+
+    if (unlikely(!(cqe->flags & IORING_CQE_F_BUFFER))) {
+        LOG_BUG("no buffer flag fd=%d", fd);
+        queue_close(ctx, fd);
+        return;
+    }
+
+    uint16_t buf_idx = (uint16_t)(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
+
+    DEBUG_ONLY(if (buf_idx >= NUM_BUFFERS) {
+        LOG_BUG("invalid buf_idx %u fd=%d", buf_idx, fd);
+        queue_close(ctx, fd);
+        return;
+    });
+
+    if (unlikely(!queue_send(ctx, fd, buf_idx))) {
+        queue_close(ctx, fd);
+        return;
+    }
+
+    if (unlikely(!more && c && !c->closing)) {
+        queue_recv(ctx, fd);
+    }
+}
+
+static inline void handle_send(struct server_ctx *ctx, struct io_uring_cqe *cqe,
+                                int fd, uint16_t buf_idx) {
+    /* Always recycle buffer first */
+    buf_ring_recycle(&ctx->br, buf_idx);
+
+    int res = cqe->res;
+    if (unlikely(res < 0)) {
+        if (res != -EPIPE && res != -ECONNRESET && res != -EBADF && res != -ECANCELED) {
+            LOG_ERROR("send error %d fd=%d", res, fd);
+        }
+        queue_close(ctx, fd);
+    } else if (unlikely((uint32_t)res < HTTP_200_LEN)) {
+        LOG_WARN("partial send fd=%d %d/%zu", fd, res, HTTP_200_LEN);
+        queue_close(ctx, fd);
+    }
+    /* Success: connection stays open for keep-alive */
+}
+
+static inline void handle_close(int fd) {
+    struct conn_state *c = get_conn(fd);
+    if (c) {
+        c->closing = 0;
+        c->recv_active = 0;
+    }
+}
+
+/* ============================================================================
+ * Main event loop - ULTRA HOT PATH
+ * ============================================================================ */
+
+/* Handler jump table for branchless dispatch */
+typedef void (*cqe_handler_t)(struct server_ctx *, struct io_uring_cqe *, int, uint16_t);
+
+static void handle_accept_wrapper(struct server_ctx *ctx, struct io_uring_cqe *cqe,
+                                   int fd, uint16_t buf_idx) {
+    (void)fd; (void)buf_idx;
+    handle_accept(ctx, cqe);
+}
+
+static void handle_recv_wrapper(struct server_ctx *ctx, struct io_uring_cqe *cqe,
+                                 int fd, uint16_t buf_idx) {
+    (void)buf_idx;
+    handle_recv(ctx, cqe, fd);
+}
+
+static void handle_send_wrapper(struct server_ctx *ctx, struct io_uring_cqe *cqe,
+                                 int fd, uint16_t buf_idx) {
+    handle_send(ctx, cqe, fd, buf_idx);
+}
+
+static void handle_close_wrapper(struct server_ctx *ctx, struct io_uring_cqe *cqe,
+                                  int fd, uint16_t buf_idx) {
+    (void)ctx; (void)cqe; (void)buf_idx;
+    handle_close(fd);
+}
+
+static void handle_setsockopt_wrapper(struct server_ctx *ctx, struct io_uring_cqe *cqe,
+                                       int fd, uint16_t buf_idx) {
+    (void)buf_idx;
+    handle_setsockopt(ctx, cqe, fd);
+}
+
+static const cqe_handler_t g_handlers[5] = {
+    [OP_ACCEPT]     = handle_accept_wrapper,
+    [OP_RECV]       = handle_recv_wrapper,
+    [OP_SEND]       = handle_send_wrapper,
+    [OP_CLOSE]      = handle_close_wrapper,
+    [OP_SETSOCKOPT] = handle_setsockopt_wrapper,
+};
 
 static void event_loop(struct server_ctx *ctx) {
     struct __kernel_timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
 
-    /* Start multishot accept */
-    add_accept(ctx);
+    if (unlikely(!queue_accept(ctx))) {
+        LOG_FATAL("Failed to start accept");
+        return;
+    }
 
-    while (ctx->running) {
-        struct io_uring_cqe *cqe;
+    /* Cache frequently accessed values */
+    struct uring_cq *cq = &ctx->ring.cq;
+    const uint32_t cq_mask = cq->ring_mask;
+    struct io_uring_cqe *cqes = cq->cqes;
 
-        /* Single syscall submit + wait per CLAUDE.md */
-        int ret = uring_submit_and_wait_timeout(&ctx->ring, &cqe, 1, &ts);
-        if (ret < 0 && ret != -ETIME) {
-            if (ret == -EINTR)
-                continue;
-            fprintf(stderr, "submit_and_wait error: %d\n", ret);
+    while (likely(ctx->running)) {
+        int ret = uring_submit_and_wait(&ctx->ring, 1, &ts);
+        if (unlikely(ret < 0 && ret != -ETIME && ret != -EINTR)) {
+            LOG_FATAL("submit_and_wait: %d", ret);
             break;
         }
 
-        /*
-         * Direct CQ drain per CLAUDE.md:
-         * "Acquire-release semantics match kernel expectations"
-         */
-        uint32_t head = *ctx->ring.cq.khead;
-        uint32_t tail = smp_load_acquire(ctx->ring.cq.ktail);
-        uint32_t processed = 0;
+        uint32_t head = *cq->khead;
+        uint32_t tail = smp_load_acquire(cq->ktail);
 
         while (head != tail) {
-            struct io_uring_cqe *cqe = &ctx->ring.cq.cqes[head & *ctx->ring.cq.kring_mask];
+            struct io_uring_cqe *cqe = &cqes[head & cq_mask];
 
-            uint64_t user_data = cqe->user_data;
-            int32_t fd = decode_fd(user_data);
-            uint8_t op = decode_op(user_data);
-            uint16_t buf_idx = decode_buf_idx(user_data);
+            /* Prefetch next CQE */
+            prefetch_r(&cqes[(head + 1) & cq_mask]);
 
-            switch (op) {
-            case OP_ACCEPT:
-                handle_accept(ctx, cqe);
-                break;
-            case OP_RECV:
-                handle_recv(ctx, cqe, fd);
-                break;
-            case OP_SEND:
-                handle_send(ctx, cqe, fd, buf_idx);
-                break;
-            case OP_CLOSE:
-                /* Close complete - nothing to do */
-                break;
+            uint64_t ud = cqe->user_data;
+            int32_t fd = decode_fd(ud);
+            uint8_t op = decode_op(ud);
+            uint16_t buf_idx = decode_buf_idx(ud);
+
+            /* Jump table dispatch - no branch misprediction */
+            if (likely(op < 5)) {
+                g_handlers[op](ctx, cqe, fd, buf_idx);
+            } else {
+                LOG_BUG("unknown op %u", op);
             }
 
             head++;
-            processed++;
         }
 
-        /* Release CQ entries */
-        smp_store_release(ctx->ring.cq.khead, head);
+        smp_store_release(cq->khead, head);
     }
+
+    LOG_INFO("Event loop exiting");
+}
+
+/* ============================================================================
+ * Input validation (startup only)
+ * ============================================================================ */
+
+static int parse_int(const char *str, int min, int max, const char *name) {
+    char *end;
+    errno = 0;
+    long val = strtol(str, &end, 10);
+
+    if (errno || end == str || *end != '\0' || val < min || val > max) {
+        LOG_FATAL("Invalid %s: '%s' (must be %d-%d)", name, str, min, max);
+        return -1;
+    }
+    return (int)val;
 }
 
 /* ============================================================================
@@ -763,51 +998,64 @@ int main(int argc, char *argv[]) {
     int port = 8080;
     int cpu = 0;
 
-    if (argc > 1)
-        port = atoi(argv[1]);
-    if (argc > 2)
-        cpu = atoi(argv[2]);
-
-    printf("Raw io_uring HTTP server (no liburing)\n");
-    printf("  Port: %d\n", port);
-    printf("  CPU: %d\n", cpu);
-    printf("  SQ entries: %d\n", SQ_ENTRIES);
-    printf("  CQ entries: %d\n", CQ_ENTRIES);
-    printf("  Buffers: %d x %d bytes\n", NUM_BUFFERS, BUFFER_SIZE);
-
-    /* Pin to CPU per CLAUDE.md */
-    if (set_cpu_affinity(cpu) < 0) {
-        fprintf(stderr, "Warning: Failed to set CPU affinity\n");
+    if (argc > 1) {
+        port = parse_int(argv[1], 1, 65535, "port");
+        if (port < 0) return 1;
+    }
+    if (argc > 2) {
+        cpu = parse_int(argv[2], 0, CPU_SETSIZE - 1, "cpu");
+        if (cpu < 0) return 1;
     }
 
-    struct server_ctx ctx = { .running = true };
+#ifdef DEBUG
+    fprintf(stderr, "=== DEBUG BUILD - NOT FOR PRODUCTION ===\n");
+#endif
 
-    /* Initialize io_uring */
+    LOG_INFO("io_uring server starting - port=%d cpu=%d sq=%d cq=%d bufs=%dx%d",
+             port, cpu, SQ_ENTRIES, CQ_ENTRIES, NUM_BUFFERS, BUFFER_SIZE);
+
+    if (set_cpu_affinity(cpu) < 0) {
+        LOG_WARN("Failed to set CPU affinity");
+    }
+
+    struct server_ctx ctx = { .running = 1 };
+    g_ctx = &ctx;
+
+    /* Clear connection state */
+    memset(g_conns, 0, sizeof(g_conns));
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
     int ret = uring_init(&ctx.ring);
     if (ret < 0) {
-        fprintf(stderr, "io_uring init failed: %s\n", strerror(-ret));
+        LOG_FATAL("io_uring init: %d", ret);
         return 1;
     }
-    printf("  io_uring features: 0x%x\n", ctx.ring.features);
+    LOG_INFO("io_uring features: 0x%x", ctx.ring.features);
 
-    /* Initialize buffer ring */
     ret = buf_ring_init(&ctx.ring, &ctx.br);
     if (ret < 0) {
-        fprintf(stderr, "Buffer ring init failed: %s\n", strerror(-ret));
+        LOG_FATAL("buffer ring init: %d", ret);
         return 1;
     }
-    printf("  Buffer ring initialized\n");
 
-    /* Create listening socket */
     ctx.listen_fd = create_listen_socket(port, cpu);
     if (ctx.listen_fd < 0) {
         return 1;
     }
-    printf("  Listening on port %d\n", port);
-    printf("\nServer ready. Ctrl+C to stop.\n\n");
 
-    /* Run event loop */
+    LOG_INFO("Listening on port %d", port);
+
     event_loop(&ctx);
 
+    close(ctx.listen_fd);
+    close(ctx.ring.ring_fd);
+
+    LOG_INFO("Server stopped");
     return 0;
 }
