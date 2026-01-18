@@ -80,6 +80,16 @@ sqe->buf_group = BUF_GROUP_ID;
 
 Buffer ID extracted from `cqe->flags >> IORING_CQE_BUFFER_SHIFT`.
 
+### No Syscalls in Hot Path
+
+Every operation after `io_uring_setup` goes through the ring. No exceptions.
+
+- **TCP_NODELAY**: Set via `IORING_OP_URING_CMD` + `SOCKET_URING_OP_SETSOCKOPT`, not `setsockopt(2)`
+- **Connection close**: Always `IORING_OP_CLOSE`, never `close(2)`
+- **Error paths**: Queue async close, don't block
+
+Requires kernel 6.7+ for socket commands. This is non-negotiable—a single blocking syscall in the accept path destroys tail latency under load.
+
 ### TLS Record Bundling
 
 Nagle's algorithm is disabled (`TCP_NODELAY`). Multiple TLS records coalesced via `MSG_MORE`:
@@ -114,7 +124,7 @@ Client sockaddr captured at accept time, hashed into per-core rate limit table.
 
 ## Constraints
 
-- **Not portable**: Linux 6.1+ required. Missing `io_uring` features are fatal.
+- **Not portable**: Linux 6.7+ required (socket commands). Missing `io_uring` features are fatal.
 - **Not a framework**: Application logic is compiled in.
 - **Not QUIC**: TCP only. UDP requires different batching strategies.
 - **Not vectored I/O**: Fixed-size buffers simplify accounting.
