@@ -185,6 +185,13 @@ static int uring_mmap(struct uring *ring, struct io_uring_params *p) {
     sq->ring_mask = *sq->kring_mask;
     sq->ring_entries = *sq->kring_entries;
 
+    /* Pre-fill SQ array with identity mapping.
+     * Since we use SINGLE_ISSUER, sequential allocation, and contiguous submission,
+     * array[n % size] = n % size is always correct. This enables O(1) submit. */
+    for (uint32_t i = 0; i < sq->ring_entries; i++) {
+        sq->array[i] = i;
+    }
+
     /* Setup CQ pointers */
     cq->khead = cq->ring_ptr + p->cq_off.head;
     cq->ktail = cq->ring_ptr + p->cq_off.tail;
@@ -249,6 +256,9 @@ static inline struct io_uring_sqe *uring_get_sqe(struct uring *ring) {
     return sqe;
 }
 
+/* O(1) submit - relies on identity mapping array[n] = n pre-filled at init.
+ * Invariant: ktail == sqe_head at entry (proven in SQE_OPTIMIZATION.md).
+ * Requirements: SINGLE_ISSUER, sequential allocation, contiguous submission. */
 static inline int uring_submit(struct uring *ring) {
     struct uring_sq *sq = &ring->sq;
     uint32_t to_submit = sq->sqe_tail - sq->sqe_head;
@@ -256,17 +266,7 @@ static inline int uring_submit(struct uring *ring) {
     if (!to_submit)
         return 0;
 
-    /* Fill SQ array with SQE indices */
-    uint32_t mask = sq->ring_mask;
-    uint32_t ktail = *sq->ktail;
-    uint32_t i = sq->sqe_head;
-
-    /* Unrolled loop for common case */
-    while (i != sq->sqe_tail) {
-        sq->array[ktail & mask] = i & mask;
-        ktail++;
-        i++;
-    }
+    uint32_t ktail = *sq->ktail + to_submit;
 
     smp_store_release(sq->ktail, ktail);
     sq->sqe_head = sq->sqe_tail;
@@ -348,7 +348,9 @@ static int buf_ring_init(struct uring *ring, struct buf_ring *br) {
     return 0;
 }
 
-/* Hot path - inline, no validation in production */
+/* Hot path - inline, no validation in production
+ * IMPORTANT: Does NOT issue memory barrier. Caller MUST call buf_ring_sync()
+ * after batching recycles to make buffers visible to kernel. */
 static inline void buf_ring_recycle(struct buf_ring *br, uint16_t bid) {
     DEBUG_ONLY(if (bid > br->mask) { LOG_BUG("invalid bid %u", bid); return; });
 
@@ -361,6 +363,11 @@ static inline void buf_ring_recycle(struct buf_ring *br, uint16_t bid) {
     buf->bid = bid;
 
     br->tail = tail + 1;
+    /* NO barrier - call buf_ring_sync() after batch */
+}
+
+/* Publish recycled buffers to kernel. Call once after batch of buf_ring_recycle(). */
+static inline void buf_ring_sync(struct buf_ring *br) {
     smp_store_release(&br->br->tail, br->tail);
 }
 

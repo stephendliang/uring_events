@@ -609,6 +609,8 @@ static void event_loop(struct server_ctx *ctx) {
             head++;
         }
 
+        /* Batch-publish recycled buffers + consumed CQEs */
+        buf_ring_sync(&ctx->br);
         smp_store_release(cq->khead, head);
     }
 

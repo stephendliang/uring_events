@@ -23,6 +23,7 @@ set -e
 PORT="${1:-8080}"
 CPU="${2:-0}"
 SOURCE="event.c"
+HEADER="uring.h"
 BINARY="event"
 CC="${CC:-gcc}"
 
@@ -69,7 +70,11 @@ validate_source() {
         log_fatal "Source file '$SOURCE' not found!"
     fi
 
-    log_info "Checking $SOURCE for critical patterns..."
+    if [ ! -f "$HEADER" ]; then
+        log_fatal "Header file '$HEADER' not found!"
+    fi
+
+    log_info "Checking $SOURCE and $HEADER for critical patterns..."
 
     # ---------------------------------------------------------------------
     # CHECK 1: Multishot recv must have len=0
@@ -93,17 +98,16 @@ validate_source() {
     # ---------------------------------------------------------------------
     # CHECK 2: No liburing includes (we don't use liburing)
     # ---------------------------------------------------------------------
-    if grep -n '#include.*<liburing' "$SOURCE" > /dev/null 2>&1; then
+    if grep -n '#include.*<liburing' "$SOURCE" "$HEADER" 2>/dev/null; then
         log_error "CRITICAL: Found liburing include!"
         log_error "         This server uses raw io_uring syscalls, not liburing"
-        grep -n '#include.*<liburing' "$SOURCE"
         errors=$((errors + 1))
     else
         log_ok "No liburing dependency (correct - raw syscalls)"
     fi
 
     # ---------------------------------------------------------------------
-    # CHECK 3: Required io_uring flags must be present
+    # CHECK 3: Required io_uring flags must be present (in source or header)
     # ---------------------------------------------------------------------
     local required_flags=(
         "IORING_SETUP_SUBMIT_ALL"
@@ -113,10 +117,10 @@ validate_source() {
     )
 
     for flag in "${required_flags[@]}"; do
-        if grep -q "$flag" "$SOURCE"; then
+        if grep -q "$flag" "$SOURCE" "$HEADER" 2>/dev/null; then
             log_ok "Found $flag"
         else
-            log_error "MISSING: $flag not found in source!"
+            log_error "MISSING: $flag not found in source or header!"
             log_error "         This flag is required per CLAUDE.md architecture"
             errors=$((errors + 1))
         fi
@@ -164,7 +168,7 @@ validate_source() {
     # ---------------------------------------------------------------------
     # CHECK 8: No SQPOLL (explicitly avoided per CLAUDE.md)
     # ---------------------------------------------------------------------
-    if grep -q "IORING_SETUP_SQPOLL" "$SOURCE"; then
+    if grep -q "IORING_SETUP_SQPOLL" "$SOURCE" "$HEADER" 2>/dev/null; then
         log_warn "SQPOLL found - per CLAUDE.md this should be avoided"
         log_warn "         'Kernel polling threads burn CPU and fight for cache'"
     else
@@ -184,10 +188,86 @@ validate_source() {
     # ---------------------------------------------------------------------
     # CHECK 10: Memory barriers present (for correct ring operation)
     # ---------------------------------------------------------------------
-    if grep -q "ATOMIC_ACQUIRE\|ATOMIC_RELEASE\|smp_load_acquire\|smp_store_release" "$SOURCE"; then
+    if grep -q "ATOMIC_ACQUIRE\|ATOMIC_RELEASE\|smp_load_acquire\|smp_store_release" "$SOURCE" "$HEADER" 2>/dev/null; then
         log_ok "Memory barriers present"
     else
         log_warn "No memory barriers found - may cause race conditions"
+    fi
+
+    # ---------------------------------------------------------------------
+    # CHECK 11: Double-close prevention (connection state tracking)
+    # ---------------------------------------------------------------------
+    if grep -q "closing.*:.*1\|conn_state\|double.close\|Prevent double" "$SOURCE"; then
+        log_ok "Double-close prevention present"
+    else
+        log_warn "No double-close prevention found - may cause EBADF errors"
+    fi
+
+    # ---------------------------------------------------------------------
+    # CHECK 12: ENOBUFS handling (must re-arm recv on buffer exhaustion)
+    # ---------------------------------------------------------------------
+    if grep -A5 "ENOBUFS" "$SOURCE" | grep -q "add_recv\|rearm"; then
+        log_ok "ENOBUFS handling re-arms recv"
+    else
+        log_warn "ENOBUFS may not re-arm recv - connections could hang"
+    fi
+
+    # ---------------------------------------------------------------------
+    # CHECK 13: Input validation (port/CPU bounds checking)
+    # ---------------------------------------------------------------------
+    if grep -q "parse_port\|strtol\|65535" "$SOURCE"; then
+        log_ok "Input validation present"
+    else
+        log_warn "No input validation - invalid args may cause issues"
+    fi
+
+    # ---------------------------------------------------------------------
+    # CHECK 14: Signal handling (graceful shutdown)
+    # ---------------------------------------------------------------------
+    if grep -q "signal_handler\|SIGINT\|SIGTERM\|sigaction" "$SOURCE"; then
+        log_ok "Signal handling present (graceful shutdown)"
+    else
+        log_warn "No signal handling - Ctrl+C will not cleanup properly"
+    fi
+
+    # ---------------------------------------------------------------------
+    # CHECK 15: Buffer index validation
+    # ---------------------------------------------------------------------
+    if grep -q "buf_idx.*>=.*NUM_BUFFERS\|bid.*>=.*buf_cnt\|invalid buffer" "$SOURCE"; then
+        log_ok "Buffer index validation present"
+    else
+        log_warn "No buffer index validation - kernel bugs could cause OOB access"
+    fi
+
+    # ---------------------------------------------------------------------
+    # CHECK 16: SQ full handling (no mid-loop syscalls per CLAUDE.md)
+    # ---------------------------------------------------------------------
+    if grep -q "SQ full" "$SOURCE"; then
+        log_ok "SQ full handling present"
+        # Verify we're NOT doing mid-loop syscalls (actual calls, not comments)
+        if grep -v "^\s*/\*\|^\s*\*" "$SOURCE" | grep -q "uring_flush("; then
+            log_warn "uring_flush() calls found - violates single-syscall pattern"
+        fi
+    else
+        log_warn "No SQ full handling - may leak resources under load"
+    fi
+
+    # ---------------------------------------------------------------------
+    # CHECK 17: Partial send handling
+    # ---------------------------------------------------------------------
+    if grep -q "Partial send\|res.*<.*HTTP_200_LEN" "$SOURCE"; then
+        log_ok "Partial send handling present"
+    else
+        log_warn "No partial send handling - clients may receive truncated responses"
+    fi
+
+    # ---------------------------------------------------------------------
+    # CHECK 18: Static assertions for compile-time validation
+    # ---------------------------------------------------------------------
+    if grep -q "_Static_assert\|static_assert" "$SOURCE"; then
+        log_ok "Compile-time assertions present"
+    else
+        log_warn "No compile-time assertions - misconfiguration possible"
     fi
 
     echo ""
