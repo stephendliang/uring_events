@@ -238,7 +238,7 @@ static inline void prep_setsockopt_direct(struct io_uring_sqe *sqe, int fd,
                                            int level, int optname,
                                            void *optval, int optlen) {
     sqe->opcode = IORING_OP_URING_CMD;
-    sqe->flags = 0;
+    sqe->flags = IOSQE_CQE_SKIP_SUCCESS;  /* No CQE on success - reduces CQ pressure */
     sqe->ioprio = 0;
     sqe->fd = fd;
     sqe->off = 0;  /* cmd_op = SOCKET_URING_OP_SETSOCKOPT (0) */
@@ -495,24 +495,6 @@ static inline void handle_recv(struct server_ctx *ctx, struct io_uring_cqe *cqe,
     }
 }
 
-static inline void handle_send(struct server_ctx *ctx, struct io_uring_cqe *cqe,
-                                int fd, uint16_t buf_idx) {
-    /* Always recycle buffer first */
-    buf_ring_recycle(&ctx->br, buf_idx);
-
-    int res = cqe->res;
-    if (unlikely(res < 0)) {
-        if (res != -EPIPE && res != -ECONNRESET && res != -EBADF && res != -ECANCELED) {
-            LOG_ERROR("send error %d fd=%d", res, fd);
-        }
-        queue_close(ctx, fd);
-    } else if (unlikely((uint32_t)res < HTTP_200_LEN)) {
-        LOG_WARN("partial send fd=%d %d/%zu", fd, res, HTTP_200_LEN);
-        queue_close(ctx, fd);
-    }
-    /* Success: connection stays open for keep-alive */
-}
-
 static inline void handle_close(int fd) {
     struct conn_state *c = get_conn(fd);
     if (c) {
@@ -524,46 +506,6 @@ static inline void handle_close(int fd) {
 /* ============================================================================
  * Main event loop - ULTRA HOT PATH
  * ============================================================================ */
-
-/* Handler jump table for branchless dispatch */
-typedef void (*cqe_handler_t)(struct server_ctx *, struct io_uring_cqe *, int, uint16_t);
-
-static void handle_accept_wrapper(struct server_ctx *ctx, struct io_uring_cqe *cqe,
-                                   int fd, uint16_t buf_idx) {
-    (void)fd; (void)buf_idx;
-    handle_accept(ctx, cqe);
-}
-
-static void handle_recv_wrapper(struct server_ctx *ctx, struct io_uring_cqe *cqe,
-                                 int fd, uint16_t buf_idx) {
-    (void)buf_idx;
-    handle_recv(ctx, cqe, fd);
-}
-
-static void handle_send_wrapper(struct server_ctx *ctx, struct io_uring_cqe *cqe,
-                                 int fd, uint16_t buf_idx) {
-    handle_send(ctx, cqe, fd, buf_idx);
-}
-
-static void handle_close_wrapper(struct server_ctx *ctx, struct io_uring_cqe *cqe,
-                                  int fd, uint16_t buf_idx) {
-    (void)ctx; (void)cqe; (void)buf_idx;
-    handle_close(fd);
-}
-
-static void handle_setsockopt_wrapper(struct server_ctx *ctx, struct io_uring_cqe *cqe,
-                                       int fd, uint16_t buf_idx) {
-    (void)buf_idx;
-    handle_setsockopt(ctx, cqe, fd);
-}
-
-static const cqe_handler_t g_handlers[5] = {
-    [OP_ACCEPT]     = handle_accept_wrapper,
-    [OP_RECV]       = handle_recv_wrapper,
-    [OP_SEND]       = handle_send_wrapper,
-    [OP_CLOSE]      = handle_close_wrapper,
-    [OP_SETSOCKOPT] = handle_setsockopt_wrapper,
-};
 
 static void event_loop(struct server_ctx *ctx) {
     struct __kernel_timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
@@ -578,6 +520,11 @@ static void event_loop(struct server_ctx *ctx) {
     const uint32_t cq_mask = cq->ring_mask;
     struct io_uring_cqe *cqes = cq->cqes;
 
+    /* Cache buf_ring invariants - these never change after init */
+    struct io_uring_buf_ring *const br_ring = ctx->br.br;
+    uint8_t *const br_base = ctx->br.buf_base;
+    const uint16_t br_mask = ctx->br.mask;
+
     while (likely(ctx->running)) {
         int ret = uring_submit_and_wait(&ctx->ring, 1, &ts);
         if (unlikely(ret < 0 && ret != -ETIME && ret != -EINTR)) {
@@ -588,6 +535,10 @@ static void event_loop(struct server_ctx *ctx) {
         uint32_t head = *cq->khead;
         uint32_t tail = smp_load_acquire(cq->ktail);
 
+        /* Cache buffer ring tail locally for this batch */
+        uint16_t br_tail = ctx->br.tail;
+        const uint16_t br_tail_start = br_tail;
+
         while (head != tail) {
             struct io_uring_cqe *cqe = &cqes[head & cq_mask];
 
@@ -597,20 +548,55 @@ static void event_loop(struct server_ctx *ctx) {
             uint64_t ud = cqe->user_data;
             int32_t fd = decode_fd(ud);
             uint8_t op = decode_op(ud);
-            uint16_t buf_idx = decode_buf_idx(ud);
 
-            /* Jump table dispatch - no branch misprediction */
-            if (likely(op < 5)) {
-                g_handlers[op](ctx, cqe, fd, buf_idx);
-            } else {
+            /* Switch dispatch - enables inlining and uses direct branches */
+            switch (op) {
+            case OP_ACCEPT:
+                handle_accept(ctx, cqe);
+                break;
+            case OP_RECV:
+                ctx->br.tail = br_tail;   /* Sync cached → ctx before call */
+                handle_recv(ctx, cqe, fd);
+                br_tail = ctx->br.tail;   /* Sync ctx → cached after call */
+                break;
+            case OP_SEND: {
+                uint16_t buf_idx = decode_buf_idx(ud);
+                /* Inline buffer recycling with cached values */
+                struct io_uring_buf *buf = &br_ring->bufs[br_tail & br_mask];
+                buf->addr = (uint64_t)(br_base + ((uint32_t)buf_idx << BUFFER_SHIFT));
+                buf->len = BUFFER_SIZE;
+                buf->bid = buf_idx;
+                br_tail++;
+                /* Send completion error checking */
+                int res = cqe->res;
+                if (unlikely(res < 0)) {
+                    if (res != -EPIPE && res != -ECONNRESET && res != -EBADF && res != -ECANCELED)
+                        LOG_ERROR("send error %d fd=%d", res, fd);
+                    queue_close(ctx, fd);
+                } else if (unlikely((uint32_t)res < HTTP_200_LEN)) {
+                    LOG_WARN("partial send fd=%d %d/%zu", fd, res, HTTP_200_LEN);
+                    queue_close(ctx, fd);
+                }
+                break;
+            }
+            case OP_CLOSE:
+                handle_close(fd);
+                break;
+            case OP_SETSOCKOPT:
+                handle_setsockopt(ctx, cqe, fd);
+                break;
+            default:
                 LOG_BUG("unknown op %u", op);
+                break;
             }
 
             head++;
         }
 
-        /* Batch-publish recycled buffers + consumed CQEs */
-        buf_ring_sync(&ctx->br);
+        /* Write back cached tail and sync if buffers were recycled */
+        ctx->br.tail = br_tail;
+        if (br_tail != br_tail_start)
+            buf_ring_sync(&ctx->br);
         smp_store_release(cq->khead, head);
     }
 
