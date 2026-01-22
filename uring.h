@@ -70,6 +70,7 @@ struct uring_sq {
     uint32_t ring_entries;      /* Cached from *kring_entries */
     uint32_t sqe_head;          /* Our head for tracking submissions */
     uint32_t sqe_tail;          /* Our tail for tracking submissions */
+    uint32_t cached_khead;      /* Cached kernel head - avoid repeated loads */
 
     /* Init-time only */
     uint32_t *kflags;
@@ -184,6 +185,7 @@ static int uring_mmap(struct uring *ring, struct io_uring_params *p) {
     /* Cache frequently-used values */
     sq->ring_mask = *sq->kring_mask;
     sq->ring_entries = *sq->kring_entries;
+    sq->cached_khead = 0;       /* Kernel starts at 0 */
 
     /* Pre-fill SQ array with identity mapping.
      * Since we use SINGLE_ISSUER, sequential allocation, and contiguous submission,
@@ -242,12 +244,15 @@ static int uring_init(struct uring *ring) {
 
 static inline struct io_uring_sqe *uring_get_sqe(struct uring *ring) {
     struct uring_sq *sq = &ring->sq;
-    uint32_t head = smp_load_acquire(sq->khead);
     uint32_t next = sq->sqe_tail + 1;
 
-    /* Check if SQ is full */
-    if (unlikely(next - head > sq->ring_entries))
-        return NULL;
+    /* Fast path: check against cached head (no memory barrier needed) */
+    if (unlikely(next - sq->cached_khead > sq->ring_entries)) {
+        /* Slow path: ring looks full, reload head from kernel */
+        sq->cached_khead = smp_load_acquire(sq->khead);
+        if (next - sq->cached_khead > sq->ring_entries)
+            return NULL;
+    }
 
     struct io_uring_sqe *sqe = &sq->sqes[sq->sqe_tail & sq->ring_mask];
     sq->sqe_tail = next;
@@ -266,9 +271,8 @@ static inline int uring_submit(struct uring *ring) {
     if (!to_submit)
         return 0;
 
-    uint32_t ktail = *sq->ktail + to_submit;
-
-    smp_store_release(sq->ktail, ktail);
+    /* Invariant: *ktail == sqe_head, so new ktail = sqe_head + to_submit = sqe_tail */
+    smp_store_release(sq->ktail, sq->sqe_tail);
     sq->sqe_head = sq->sqe_tail;
 
     return (int)to_submit;
@@ -280,11 +284,14 @@ static inline int uring_submit_and_wait(struct uring *ring,
     int to_submit = uring_submit(ring);
     unsigned flags = IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG;
 
-    /* Zero-initialize to avoid kernel reading garbage padding */
-    struct io_uring_getevents_arg arg;
-    memset(&arg, 0, sizeof(arg));
-    arg.sigmask_sz = _NSIG / 8;
-    arg.ts = (uint64_t)ts;
+    /* Pre-zeroed template avoids memset on every iteration.
+     * Only sigmask_sz and ts need values; rest must be 0 for kernel. */
+    struct io_uring_getevents_arg arg = {
+        .sigmask = 0,
+        .sigmask_sz = _NSIG / 8,
+        .min_wait_usec = 0,
+        .ts = (uint64_t)ts,
+    };
 
     long ret = syscall(__NR_io_uring_enter, ring->ring_fd, to_submit, wait_nr,
                        flags, &arg, sizeof(arg));
