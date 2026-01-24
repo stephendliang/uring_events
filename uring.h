@@ -22,6 +22,16 @@
 #define IORING_OP_URING_CMD 46
 #endif
 
+/* IORING_SETUP_NO_SQARRAY: added in Linux 6.6, eliminates SQ array indirection */
+#ifndef IORING_SETUP_NO_SQARRAY
+#define IORING_SETUP_NO_SQARRAY (1U << 16)
+#endif
+
+/* IORING_FILE_INDEX_ALLOC: kernel allocates fixed file slot (direct accept) */
+#ifndef IORING_FILE_INDEX_ALLOC
+#define IORING_FILE_INDEX_ALLOC (~0U)
+#endif
+
 /* ============================================================================
  * Memory barriers - x86-TSO optimized
  * On x86, loads are not reordered with other loads, stores are not reordered
@@ -102,6 +112,7 @@ struct uring {
     struct uring_cq cq;
     int ring_fd;
     uint32_t features;
+    uint32_t flags;  /* Accepted setup flags */
 };
 
 /* Provided buffer ring - optimized layout */
@@ -134,8 +145,13 @@ static int uring_mmap(struct uring *ring, struct io_uring_params *p) {
     size_t size;
     int ret;
 
-    /* SQ ring mapping */
-    size = p->sq_off.array + p->sq_entries * sizeof(uint32_t);
+    /* SQ ring mapping.
+     * With SINGLE_MMAP (common), SQ and CQ share one mapping.
+     * With NO_SQARRAY, sq_off.array is 0, so use CQ end as size. */
+    if (p->flags & IORING_SETUP_NO_SQARRAY)
+        size = p->cq_off.cqes + p->cq_entries * sizeof(struct io_uring_cqe);
+    else
+        size = p->sq_off.array + p->sq_entries * sizeof(uint32_t);
     sq->ring_sz = size;
     sq->ring_ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
                         MAP_SHARED | MAP_POPULATE, ring->ring_fd,
@@ -180,18 +196,19 @@ static int uring_mmap(struct uring *ring, struct io_uring_params *p) {
     sq->kring_entries = sq->ring_ptr + p->sq_off.ring_entries;
     sq->kflags = sq->ring_ptr + p->sq_off.flags;
     sq->kdropped = sq->ring_ptr + p->sq_off.dropped;
-    sq->array = sq->ring_ptr + p->sq_off.array;
-
     /* Cache frequently-used values */
     sq->ring_mask = *sq->kring_mask;
     sq->ring_entries = *sq->kring_entries;
     sq->cached_khead = 0;       /* Kernel starts at 0 */
 
-    /* Pre-fill SQ array with identity mapping.
-     * Since we use SINGLE_ISSUER, sequential allocation, and contiguous submission,
-     * array[n % size] = n % size is always correct. This enables O(1) submit. */
-    for (uint32_t i = 0; i < sq->ring_entries; i++) {
-        sq->array[i] = i;
+    if (!(p->flags & IORING_SETUP_NO_SQARRAY)) {
+        sq->array = sq->ring_ptr + p->sq_off.array;
+        /* Pre-fill SQ array with identity mapping.
+         * Since we use SINGLE_ISSUER, sequential allocation, and contiguous submission,
+         * array[n % size] = n % size is always correct. This enables O(1) submit. */
+        for (uint32_t i = 0; i < sq->ring_entries; i++) {
+            sq->array[i] = i;
+        }
     }
 
     /* Setup CQ pointers */
@@ -220,14 +237,28 @@ static int uring_init(struct uring *ring) {
               IORING_SETUP_SINGLE_ISSUER |
               IORING_SETUP_DEFER_TASKRUN |
               IORING_SETUP_COOP_TASKRUN |
-              IORING_SETUP_CQSIZE;
+              IORING_SETUP_CQSIZE |
+              IORING_SETUP_NO_SQARRAY;
     p.cq_entries = CQ_ENTRIES;
 
     ring->ring_fd = io_uring_setup(SQ_ENTRIES, &p);
+    if (ring->ring_fd < 0 && errno == EINVAL) {
+        /* Kernel may not support NO_SQARRAY, retry without it.
+         * Reset p fully since kernel may have partially modified it. */
+        memset(&p, 0, sizeof(p));
+        p.flags = IORING_SETUP_SUBMIT_ALL |
+                  IORING_SETUP_SINGLE_ISSUER |
+                  IORING_SETUP_DEFER_TASKRUN |
+                  IORING_SETUP_COOP_TASKRUN |
+                  IORING_SETUP_CQSIZE;
+        p.cq_entries = CQ_ENTRIES;
+        ring->ring_fd = io_uring_setup(SQ_ENTRIES, &p);
+    }
     if (unlikely(ring->ring_fd < 0))
         return -errno;
 
     ring->features = p.features;
+    ring->flags = p.flags;  /* Store what kernel accepted */
 
     ret = uring_mmap(ring, &p);
     if (unlikely(ret < 0)) {
@@ -349,8 +380,10 @@ static int buf_ring_init(struct uring *ring, struct buf_ring *br) {
     reg.bgid = BUFFER_GROUP_ID;
 
     int ret = io_uring_register(ring->ring_fd, IORING_REGISTER_PBUF_RING, &reg, 1);
-    if (unlikely(ret < 0))
+    if (unlikely(ret < 0)) {
+        munmap(ptr, total_size);
         return ret;
+    }
 
     return 0;
 }
@@ -376,6 +409,25 @@ static inline void buf_ring_recycle(struct buf_ring *br, uint16_t bid) {
 /* Publish recycled buffers to kernel. Call once after batch of buf_ring_recycle(). */
 static inline void buf_ring_sync(struct buf_ring *br) {
     smp_store_release(&br->br->tail, br->tail);
+}
+
+/* ============================================================================
+ * Fixed file registration for direct accept
+ * ============================================================================ */
+
+static int uring_register_fixed_files(struct uring *ring, uint32_t count) {
+    /* Allocate sparse fd array - all slots start empty (-1) */
+    size_t size = count * sizeof(int);
+    int *fds = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                    MAP_ANONYMOUS | MAP_PRIVATE | MAP_POPULATE, -1, 0);
+    if (fds == MAP_FAILED)
+        return -errno;
+
+    memset(fds, -1, size);  /* -1 = empty slot */
+
+    int ret = io_uring_register(ring->ring_fd, IORING_REGISTER_FILES, fds, count);
+    munmap(fds, size);  /* Kernel copied it, we can free */
+    return ret;
 }
 
 #endif /* URING_H */

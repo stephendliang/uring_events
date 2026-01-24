@@ -29,6 +29,18 @@
 #include <netinet/tcp.h>
 
 /* ============================================================================
+ * SIMD infrastructure for SQE template copy
+ * ============================================================================ */
+
+#if defined(__AVX512F__)
+#include <immintrin.h>
+#define USE_AVX512 1
+#elif defined(__AVX2__)
+#include <immintrin.h>
+#define USE_AVX2 1
+#endif
+
+/* ============================================================================
  * Debug/Logging macros - compiled out in production (NDEBUG)
  * ============================================================================ */
 
@@ -92,6 +104,103 @@ static const char HTTP_200_RESPONSE[] =
 #define HTTP_200_LEN (sizeof(HTTP_200_RESPONSE) - 1)
 
 /* ============================================================================
+ * Context encoding - pack into 64-bit user_data
+ * Layout: [fd:32][op:8][buf_idx:16][unused:8]
+ * ============================================================================ */
+
+enum op_type {
+    OP_ACCEPT     = 0,
+    OP_RECV       = 1,
+    OP_SEND       = 2,
+    OP_CLOSE      = 3,
+    OP_SETSOCKOPT = 4,
+};
+
+/* Pre-shifted operation codes for faster encoding */
+#define OP_ACCEPT_SHIFTED     ((uint64_t)OP_ACCEPT << 32)
+#define OP_RECV_SHIFTED       ((uint64_t)OP_RECV << 32)
+#define OP_SEND_SHIFTED       ((uint64_t)OP_SEND << 32)
+#define OP_CLOSE_SHIFTED      ((uint64_t)OP_CLOSE << 32)
+#define OP_SETSOCKOPT_SHIFTED ((uint64_t)OP_SETSOCKOPT << 32)
+
+/* ============================================================================
+ * SQE templates - 64-byte aligned for SIMD copy
+ * Only fd and user_data vary per operation; everything else is constant.
+ * ============================================================================ */
+
+__attribute__((aligned(64)))
+static const struct io_uring_sqe SQE_TEMPLATE_ACCEPT = {
+    .opcode = IORING_OP_ACCEPT,
+    .flags = IOSQE_FIXED_FILE,              /* Use fixed file for listen_fd */
+    .ioprio = IORING_ACCEPT_MULTISHOT,
+    .fd = 0,  /* Fixed file index of listen socket */
+    .off = 0,
+    .addr = 0,
+    .len = 0,
+    .accept_flags = 0,
+    .user_data = OP_ACCEPT_SHIFTED | 0xFFFFFFFF,  /* constant: idx = -1 */
+    .buf_group = 0,
+    .personality = 0,
+    .file_index = IORING_FILE_INDEX_ALLOC,  /* Kernel allocates fixed file slot */
+    .addr3 = 0,
+    .__pad2 = {0},
+};
+
+__attribute__((aligned(64)))
+static const struct io_uring_sqe SQE_TEMPLATE_RECV = {
+    .opcode = IORING_OP_RECV,
+    .flags = IOSQE_BUFFER_SELECT | IOSQE_FIXED_FILE,  /* Fixed file for client socket */
+    .ioprio = IORING_RECV_MULTISHOT,
+    .fd = 0,  /* Fixed file index, not fd */
+    .off = 0,
+    .addr = 0,
+    .len = 0,  /* MUST be 0 for multishot */
+    .msg_flags = 0,
+    .user_data = 0,  /* patched */
+    .buf_group = BUFFER_GROUP_ID,
+    .personality = 0,
+    .splice_fd_in = 0,
+    .addr3 = 0,
+    .__pad2 = {0},
+};
+
+__attribute__((aligned(64)))
+static struct io_uring_sqe SQE_TEMPLATE_SEND = {  /* non-const: addr set at init */
+    .opcode = IORING_OP_SEND,
+    .flags = IOSQE_FIXED_FILE,  /* Fixed file for client socket */
+    .ioprio = 0,
+    .fd = 0,  /* Fixed file index, not fd */
+    .off = 0,
+    .addr = 0,  /* set to HTTP_200_RESPONSE at init */
+    .len = HTTP_200_LEN,
+    .msg_flags = 0,
+    .user_data = 0,  /* patched */
+    .buf_group = 0,
+    .personality = 0,
+    .splice_fd_in = 0,
+    .addr3 = 0,
+    .__pad2 = {0},
+};
+
+__attribute__((aligned(64)))
+static const struct io_uring_sqe SQE_TEMPLATE_CLOSE = {
+    .opcode = IORING_OP_CLOSE,
+    .flags = IOSQE_FIXED_FILE,  /* Fixed file for client socket */
+    .ioprio = 0,
+    .fd = 0,  /* Fixed file index, not fd */
+    .off = 0,
+    .addr = 0,
+    .len = 0,
+    .rw_flags = 0,
+    .user_data = 0,  /* patched */
+    .buf_group = 0,
+    .personality = 0,
+    .splice_fd_in = 0,
+    .addr3 = 0,
+    .__pad2 = {0},
+};
+
+/* ============================================================================
  * Connection state - bit-packed for cache efficiency
  * ============================================================================ */
 
@@ -112,26 +221,7 @@ static inline struct conn_state *get_conn(int fd) {
     return (ufd < MAX_CONNECTIONS) ? &g_conns[ufd] : NULL;
 }
 
-/* ============================================================================
- * Context encoding - pack into 64-bit user_data
- * Layout: [fd:32][op:8][buf_idx:16][unused:8]
- * ============================================================================ */
-
-enum op_type {
-    OP_ACCEPT     = 0,
-    OP_RECV       = 1,
-    OP_SEND       = 2,
-    OP_CLOSE      = 3,
-    OP_SETSOCKOPT = 4,
-};
-
-/* Pre-shifted operation codes for faster encoding */
-#define OP_ACCEPT_SHIFTED     ((uint64_t)OP_ACCEPT << 32)
-#define OP_RECV_SHIFTED       ((uint64_t)OP_RECV << 32)
-#define OP_SEND_SHIFTED       ((uint64_t)OP_SEND << 32)
-#define OP_CLOSE_SHIFTED      ((uint64_t)OP_CLOSE << 32)
-#define OP_SETSOCKOPT_SHIFTED ((uint64_t)OP_SETSOCKOPT << 32)
-
+/* Context encoding helpers */
 static inline uint64_t encode_accept(void) {
     return OP_ACCEPT_SHIFTED | 0xFFFFFFFF; /* fd = -1 */
 }
@@ -161,91 +251,116 @@ static inline uint16_t decode_buf_idx(uint64_t ud) {
 }
 
 /* ============================================================================
- * SQE preparation - OPTIMIZED: only set required fields, no memset
+ * SQE preparation - Template copy + patch using SIMD
+ *
+ * AVX-512: Load template into ZMM, patch fd/user_data in-register, single store.
+ *          Zero store-forwarding stalls.
+ * AVX2:    Two 256-bit loads/stores, then narrow patches.
+ * Scalar:  Struct copy, then narrow patches.
  * ============================================================================ */
 
+#ifdef USE_AVX512
+
 static inline void prep_multishot_accept_direct(struct io_uring_sqe *sqe, int fd) {
-    sqe->opcode = IORING_OP_ACCEPT;
-    sqe->flags = 0;
-    sqe->ioprio = IORING_ACCEPT_MULTISHOT;
-    sqe->fd = fd;
-    sqe->off = 0;
-    sqe->addr = 0;
-    sqe->len = 0;
-    sqe->accept_flags = 0;
-    sqe->user_data = encode_accept();
-    sqe->buf_group = 0;
-    sqe->personality = 0;
-    sqe->splice_fd_in = 0;
-    sqe->addr3 = 0;
-    sqe->__pad2[0] = 0;
+    __m512i zmm = _mm512_load_si512((const __m512i *)&SQE_TEMPLATE_ACCEPT);
+    /* Patch fd at dword index 1 (byte offset 4) */
+    zmm = _mm512_mask_set1_epi32(zmm, 1U << 1, fd);
+    /* user_data is constant in template */
+    _mm512_store_si512((__m512i *)sqe, zmm);
 }
 
 static inline void prep_recv_multishot_direct(struct io_uring_sqe *sqe, int fd) {
-    sqe->opcode = IORING_OP_RECV;
-    sqe->flags = IOSQE_BUFFER_SELECT;
-    sqe->ioprio = IORING_RECV_MULTISHOT;
-    sqe->fd = fd;
-    sqe->off = 0;
-    sqe->addr = 0;
-    sqe->len = 0;  /* MUST be 0 for multishot */
-    sqe->msg_flags = 0;
-    sqe->user_data = encode_recv(fd);
-    sqe->buf_group = BUFFER_GROUP_ID;
-    sqe->personality = 0;
-    sqe->splice_fd_in = 0;
-    sqe->addr3 = 0;
-    sqe->__pad2[0] = 0;
+    __m512i zmm = _mm512_load_si512((const __m512i *)&SQE_TEMPLATE_RECV);
+    /* Patch fd at dword index 1 (byte offset 4) */
+    zmm = _mm512_mask_set1_epi32(zmm, 1U << 1, fd);
+    /* Patch user_data at qword index 4 (byte offset 32) */
+    uint64_t ud = OP_RECV_SHIFTED | (uint32_t)fd;
+    zmm = _mm512_mask_set1_epi64(zmm, 1U << 4, (long long)ud);
+    _mm512_store_si512((__m512i *)sqe, zmm);
 }
 
 static inline void prep_send_direct(struct io_uring_sqe *sqe, int fd,
                                      const void *buf, uint32_t len,
                                      uint16_t buf_idx) {
-    sqe->opcode = IORING_OP_SEND;
-    sqe->flags = 0;
-    sqe->ioprio = 0;
-    sqe->fd = fd;
-    sqe->off = 0;
-    sqe->addr = (uint64_t)buf;
-    sqe->len = len;
-    sqe->msg_flags = 0;
-    sqe->user_data = encode_send(fd, buf_idx);
-    sqe->buf_group = 0;
-    sqe->personality = 0;
-    sqe->splice_fd_in = 0;
-    sqe->addr3 = 0;
-    sqe->__pad2[0] = 0;
+    (void)buf; (void)len;  /* Template has pre-set addr and len */
+    __m512i zmm = _mm512_load_si512((const __m512i *)&SQE_TEMPLATE_SEND);
+    /* Patch fd at dword index 1 (byte offset 4) */
+    zmm = _mm512_mask_set1_epi32(zmm, 1U << 1, fd);
+    /* Patch user_data at qword index 4 (byte offset 32) */
+    uint64_t ud = OP_SEND_SHIFTED | (uint32_t)fd | ((uint64_t)buf_idx << 40);
+    zmm = _mm512_mask_set1_epi64(zmm, 1U << 4, (long long)ud);
+    _mm512_store_si512((__m512i *)sqe, zmm);
 }
 
 static inline void prep_close_direct(struct io_uring_sqe *sqe, int fd) {
-    sqe->opcode = IORING_OP_CLOSE;
-    sqe->flags = 0;
-    sqe->ioprio = 0;
-    sqe->fd = fd;
-    sqe->off = 0;
-    sqe->addr = 0;
-    sqe->len = 0;
-    sqe->rw_flags = 0;
-    sqe->user_data = encode_close(fd);
-    sqe->buf_group = 0;
-    sqe->personality = 0;
-    sqe->splice_fd_in = 0;
-    sqe->addr3 = 0;
-    sqe->__pad2[0] = 0;
+    __m512i zmm = _mm512_load_si512((const __m512i *)&SQE_TEMPLATE_CLOSE);
+    /* Patch fd at dword index 1 (byte offset 4) */
+    zmm = _mm512_mask_set1_epi32(zmm, 1U << 1, fd);
+    /* Patch user_data at qword index 4 (byte offset 32) */
+    uint64_t ud = OP_CLOSE_SHIFTED | (uint32_t)fd;
+    zmm = _mm512_mask_set1_epi64(zmm, 1U << 4, (long long)ud);
+    _mm512_store_si512((__m512i *)sqe, zmm);
 }
 
-static inline void prep_setsockopt_direct(struct io_uring_sqe *sqe, int fd,
+#else  /* AVX2 or scalar fallback */
+
+#ifdef USE_AVX2
+static inline void sqe_copy_64(struct io_uring_sqe *dst,
+                                const struct io_uring_sqe *src) {
+    __m256i lo = _mm256_load_si256((const __m256i *)src);
+    __m256i hi = _mm256_load_si256((const __m256i *)src + 1);
+    _mm256_store_si256((__m256i *)dst, lo);
+    _mm256_store_si256((__m256i *)dst + 1, hi);
+}
+#else  /* Scalar fallback */
+static inline void sqe_copy_64(struct io_uring_sqe *dst,
+                                const struct io_uring_sqe *src) {
+    *dst = *src;
+}
+#endif
+
+static inline void prep_multishot_accept_direct(struct io_uring_sqe *sqe, int fd) {
+    sqe_copy_64(sqe, &SQE_TEMPLATE_ACCEPT);
+    sqe->fd = fd;
+    /* user_data is constant in template */
+}
+
+static inline void prep_recv_multishot_direct(struct io_uring_sqe *sqe, int fd) {
+    sqe_copy_64(sqe, &SQE_TEMPLATE_RECV);
+    sqe->fd = fd;
+    sqe->user_data = OP_RECV_SHIFTED | (uint32_t)fd;
+}
+
+static inline void prep_send_direct(struct io_uring_sqe *sqe, int fd,
+                                     const void *buf, uint32_t len,
+                                     uint16_t buf_idx) {
+    (void)buf; (void)len;  /* Template has pre-set addr and len */
+    sqe_copy_64(sqe, &SQE_TEMPLATE_SEND);
+    sqe->fd = fd;
+    sqe->user_data = OP_SEND_SHIFTED | (uint32_t)fd | ((uint64_t)buf_idx << 40);
+}
+
+static inline void prep_close_direct(struct io_uring_sqe *sqe, int fd) {
+    sqe_copy_64(sqe, &SQE_TEMPLATE_CLOSE);
+    sqe->fd = fd;
+    sqe->user_data = OP_CLOSE_SHIFTED | (uint32_t)fd;
+}
+
+#endif  /* USE_AVX512 */
+
+/* SETSOCKOPT: Keep scalar - complex cmd area at offset 48, rare operation */
+static inline void prep_setsockopt_direct(struct io_uring_sqe *sqe, int idx,
                                            int level, int optname,
                                            void *optval, int optlen) {
     sqe->opcode = IORING_OP_URING_CMD;
-    sqe->flags = IOSQE_CQE_SKIP_SUCCESS;  /* No CQE on success - reduces CQ pressure */
+    sqe->flags = IOSQE_CQE_SKIP_SUCCESS | IOSQE_FIXED_FILE;  /* Fixed file for client socket */
     sqe->ioprio = 0;
-    sqe->fd = fd;
+    sqe->fd = idx;  /* Fixed file index */
     sqe->off = 0;  /* cmd_op = SOCKET_URING_OP_SETSOCKOPT (0) */
     sqe->addr = 0;
     sqe->len = 0;
     sqe->rw_flags = 0;
-    sqe->user_data = OP_SETSOCKOPT_SHIFTED | (uint32_t)fd;
+    sqe->user_data = OP_SETSOCKOPT_SHIFTED | (uint32_t)idx;
     sqe->buf_group = 0;
     sqe->personality = 0;
     sqe->splice_fd_in = 0;
@@ -419,25 +534,25 @@ static inline void handle_setsockopt(struct server_ctx *ctx,
 }
 
 static inline void handle_accept(struct server_ctx *ctx, struct io_uring_cqe *cqe) {
-    int fd = cqe->res;
+    int idx = cqe->res;  /* Fixed file INDEX, not fd */
 
-    if (likely(fd >= 0)) {
-        struct conn_state *c = get_conn(fd);
+    if (likely(idx >= 0)) {
+        struct conn_state *c = get_conn(idx);  /* idx used as connection ID */
         if (likely(c)) {
             c->closing = 0;
             c->recv_active = 0;
 
-            /* Async TCP_NODELAY via io_uring - no syscall in hot path! */
-            queue_setsockopt_nodelay(ctx, fd);
+            /* Async TCP_NODELAY via io_uring - kernel resolves fixed file internally */
+            queue_setsockopt_nodelay(ctx, idx);
 
-            if (unlikely(!queue_recv(ctx, fd))) {
-                queue_close(ctx, fd);  /* Async close */
+            if (unlikely(!queue_recv(ctx, idx))) {
+                queue_close(ctx, idx);  /* Async close */
             }
         } else {
-            queue_close(ctx, fd);  /* Async close */
+            queue_close(ctx, idx);  /* Async close */
         }
-    } else if (fd != -EAGAIN && fd != -EWOULDBLOCK && fd != -ECANCELED) {
-        LOG_ERROR("accept error: %d", fd);
+    } else if (idx != -EAGAIN && idx != -EWOULDBLOCK && idx != -ECANCELED) {
+        LOG_ERROR("accept error: %d", idx);
     }
 
     if (unlikely(!(cqe->flags & IORING_CQE_F_MORE))) {
@@ -508,7 +623,7 @@ static inline void handle_close(int fd) {
  * ============================================================================ */
 
 static void event_loop(struct server_ctx *ctx) {
-    struct __kernel_timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+    struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 };  // 100ms
 
     if (unlikely(!queue_accept(ctx))) {
         LOG_FATAL("Failed to start accept");
@@ -525,6 +640,9 @@ static void event_loop(struct server_ctx *ctx) {
     uint8_t *const br_base = ctx->br.buf_base;
     const uint16_t br_mask = ctx->br.mask;
 
+    /* Cache CQ head - we're the only writer, no need to re-read from shared memory */
+    uint32_t head = *cq->khead;
+
     while (likely(ctx->running)) {
         int ret = uring_submit_and_wait(&ctx->ring, 1, &ts);
         if (unlikely(ret < 0 && ret != -ETIME && ret != -EINTR)) {
@@ -532,7 +650,6 @@ static void event_loop(struct server_ctx *ctx) {
             break;
         }
 
-        uint32_t head = *cq->khead;
         uint32_t tail = smp_load_acquire(cq->ktail);
 
         /* Cache buffer ring tail locally for this batch */
@@ -660,6 +777,9 @@ int main(int argc, char *argv[]) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
+    /* Initialize SEND template with runtime address */
+    SQE_TEMPLATE_SEND.addr = (uint64_t)HTTP_200_RESPONSE;
+
     int ret = uring_init(&ctx.ring);
     if (ret < 0) {
         LOG_FATAL("io_uring init: %d", ret);
@@ -673,16 +793,43 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    ctx.listen_fd = create_listen_socket(port, cpu);
-    if (ctx.listen_fd < 0) {
+    int listen_fd = create_listen_socket(port, cpu);
+    if (listen_fd < 0) {
         return 1;
     }
 
-    LOG_INFO("Listening on port %d", port);
+    /* Register fixed file table for direct accept */
+    ret = uring_register_fixed_files(&ctx.ring, MAX_CONNECTIONS);
+    if (ret < 0) {
+        LOG_FATAL("fixed file registration: %d", ret);
+        close(listen_fd);
+        return 1;
+    }
+    LOG_INFO("Fixed file table registered: %d slots", MAX_CONNECTIONS);
+
+    /* Install listen_fd as fixed file index 0 */
+    int install_fds[1] = { listen_fd };
+    struct io_uring_files_update update = {
+        .offset = 0,
+        .fds = (uint64_t)(uintptr_t)install_fds,
+    };
+    ret = io_uring_register(ctx.ring.ring_fd, IORING_REGISTER_FILES_UPDATE, &update, 1);
+    if (ret < 0) {
+        LOG_FATAL("listen socket install: %d", ret);
+        close(listen_fd);
+        return 1;
+    }
+
+    /* Close the original fd - fixed file table has the reference now */
+    close(listen_fd);
+    ctx.listen_fd = 0;  /* Now this is the fixed file index */
+
+    LOG_INFO("Listening on port %d (fixed file index 0)", port);
 
     event_loop(&ctx);
 
-    close(ctx.listen_fd);
+    /* listen_fd is now a fixed file index - gets cleaned up with ring.
+     * Only close the ring fd. */
     close(ctx.ring.ring_fd);
 
     LOG_INFO("Server stopped");

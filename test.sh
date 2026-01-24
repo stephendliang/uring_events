@@ -293,16 +293,25 @@ build_server() {
     # Optimization flags per run.sh
     local OPT_FLAGS=(
         -O3
-        -march=native
-        -mtune=native
-        -fomit-frame-pointer
-        -fno-stack-protector
-        -fno-plt
-        -flto
-        -fno-semantic-interposition
-        -fvisibility=hidden
-        -DNDEBUG
+        -march=native              # Use all CPU features available
+        -mtune=native              # Tune for this specific CPU
+        -fomit-frame-pointer       # Free up RBP register
+        -fno-stack-protector       # No stack canaries (perf)
+        -fno-plt                   # Direct calls, no PLT indirection
+        -ffast-math                # Aggressive FP optimizations
+        -flto                      # Link-time optimization
+        -fno-semantic-interposition # Better inlining with LTO
+        -fvisibility=hidden        # Hide symbols by default
+        -Wunused-function
+        -ffunction-sections
+        -fdata-sections
+        -Wl,--gc-sections
+        -DNDEBUG                   # Disable asserts
     )
+
+    # Optional: PGO (Profile-Guided Optimization) - uncomment for 2-pass build
+    # PASS1: add -fprofile-generate, run workload, then
+    # PASS2: add -fprofile-use
 
     log_info "Building with: ${OPT_FLAGS[*]}"
 
@@ -315,13 +324,53 @@ build_server() {
 }
 
 # =============================================================================
-# Phase 3: Run Server
+# Phase 3: Hugepage Setup
+# =============================================================================
+
+setup_hugepages() {
+    echo ""
+    echo "=============================================="
+    echo " PHASE 3: Hugepage Setup"
+    echo "=============================================="
+
+    log_info "Hugepage status:"
+    grep -E "^Huge" /proc/meminfo 2>/dev/null || log_warn "Could not read /proc/meminfo"
+
+    local current=$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo "0")
+
+    if [ "$current" -eq 0 ]; then
+        log_warn "No hugepages currently reserved"
+        log_info "To enable (requires root): echo 64 > /proc/sys/vm/nr_hugepages"
+
+        # Try to allocate if we're root
+        if [ "$(id -u)" -eq 0 ]; then
+            log_info "Running as root, attempting to allocate 64 x 2MB hugepages..."
+            echo 64 > /proc/sys/vm/nr_hugepages 2>/dev/null || true
+            sleep 0.1
+            local new=$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo "0")
+            if [ "$new" -gt 0 ]; then
+                log_ok "Successfully allocated $new hugepages"
+                grep -E "^Huge" /proc/meminfo 2>/dev/null || true
+            else
+                log_warn "Failed to allocate hugepages (memory fragmentation?)"
+                log_info "Server will fall back to regular pages"
+            fi
+        else
+            log_info "Not running as root - server will fall back to regular pages"
+        fi
+    else
+        log_ok "Hugepages already available: $current"
+    fi
+}
+
+# =============================================================================
+# Phase 4: Run Server
 # =============================================================================
 
 start_server() {
     echo ""
     echo "=============================================="
-    echo " PHASE 3: Start Server"
+    echo " PHASE 4: Start Server"
     echo "=============================================="
 
     # Kill any existing instance
@@ -353,13 +402,13 @@ start_server() {
 }
 
 # =============================================================================
-# Phase 4: Test
+# Phase 5: Test
 # =============================================================================
 
 test_server() {
     echo ""
     echo "=============================================="
-    echo " PHASE 4: Tests"
+    echo " PHASE 5: Tests"
     echo "=============================================="
 
     local test_failures=0
@@ -504,13 +553,13 @@ test_server() {
 }
 
 # =============================================================================
-# Phase 5: Report
+# Phase 6: Report
 # =============================================================================
 
 report() {
     echo ""
     echo "=============================================="
-    echo " PHASE 5: Report"
+    echo " PHASE 6: Report"
     echo "=============================================="
 
     if kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -548,6 +597,7 @@ main() {
 
     validate_source
     build_server
+    setup_hugepages
     start_server
 
     if test_server; then
