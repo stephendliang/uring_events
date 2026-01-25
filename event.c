@@ -221,9 +221,9 @@ static inline struct conn_state *get_conn(int fd) {
     return (ufd < MAX_CONNECTIONS) ? &g_conns[ufd] : NULL;
 }
 
-/* Context encoding helpers */
+/* Context encoding helpers (unused - inlined at call sites)
 static inline uint64_t encode_accept(void) {
-    return OP_ACCEPT_SHIFTED | 0xFFFFFFFF; /* fd = -1 */
+    return OP_ACCEPT_SHIFTED | 0xFFFFFFFF;
 }
 
 static inline uint64_t encode_recv(int fd) {
@@ -237,6 +237,7 @@ static inline uint64_t encode_send(int fd, uint16_t buf_idx) {
 static inline uint64_t encode_close(int fd) {
     return OP_CLOSE_SHIFTED | (uint32_t)fd;
 }
+*/
 
 static inline int32_t decode_fd(uint64_t ud) {
     return (int32_t)(ud & 0xFFFFFFFF);
