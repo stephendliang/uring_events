@@ -305,24 +305,58 @@ static inline void prep_close_direct(struct io_uring_sqe *sqe, int fd) {
 #else  /* AVX2 or scalar fallback */
 
 #ifdef USE_AVX2
-static inline void sqe_copy_64(struct io_uring_sqe *dst,
-                                const struct io_uring_sqe *src) {
-    __m256i lo = _mm256_load_si256((const __m256i *)src);
-    __m256i hi = _mm256_load_si256((const __m256i *)src + 1);
-    _mm256_store_si256((__m256i *)dst, lo);
-    _mm256_store_si256((__m256i *)dst + 1, hi);
+
+static inline void prep_multishot_accept_direct(struct io_uring_sqe *sqe, int fd) {
+    __m256i lo = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_ACCEPT);
+    __m256i hi = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_ACCEPT + 1);
+    lo = _mm256_blend_epi32(lo, _mm256_set1_epi32(fd), 1 << 1);
+    _mm256_store_si256((__m256i *)sqe, lo);
+    _mm256_store_si256((__m256i *)sqe + 1, hi);
 }
+
+static inline void prep_recv_multishot_direct(struct io_uring_sqe *sqe, int fd) {
+    __m256i lo = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_RECV);
+    __m256i hi = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_RECV + 1);
+    lo = _mm256_blend_epi32(lo, _mm256_set1_epi32(fd), 1 << 1);
+    uint64_t ud = OP_RECV_SHIFTED | (uint32_t)fd;
+    hi = _mm256_blend_epi32(hi, _mm256_set1_epi64x((long long)ud), 0x03);
+    _mm256_store_si256((__m256i *)sqe, lo);
+    _mm256_store_si256((__m256i *)sqe + 1, hi);
+}
+
+static inline void prep_send_direct(struct io_uring_sqe *sqe, int fd,
+                                     const void *buf, uint32_t len,
+                                     uint16_t buf_idx) {
+    (void)buf; (void)len;
+    __m256i lo = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_SEND);
+    __m256i hi = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_SEND + 1);
+    lo = _mm256_blend_epi32(lo, _mm256_set1_epi32(fd), 1 << 1);
+    uint64_t ud = OP_SEND_SHIFTED | (uint32_t)fd | ((uint64_t)buf_idx << 40);
+    hi = _mm256_blend_epi32(hi, _mm256_set1_epi64x((long long)ud), 0x03);
+    _mm256_store_si256((__m256i *)sqe, lo);
+    _mm256_store_si256((__m256i *)sqe + 1, hi);
+}
+
+static inline void prep_close_direct(struct io_uring_sqe *sqe, int fd) {
+    __m256i lo = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_CLOSE);
+    __m256i hi = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_CLOSE + 1);
+    lo = _mm256_blend_epi32(lo, _mm256_set1_epi32(fd), 1 << 1);
+    uint64_t ud = OP_CLOSE_SHIFTED | (uint32_t)fd;
+    hi = _mm256_blend_epi32(hi, _mm256_set1_epi64x((long long)ud), 0x03);
+    _mm256_store_si256((__m256i *)sqe, lo);
+    _mm256_store_si256((__m256i *)sqe + 1, hi);
+}
+
 #else  /* Scalar fallback */
+
 static inline void sqe_copy_64(struct io_uring_sqe *dst,
                                 const struct io_uring_sqe *src) {
     *dst = *src;
 }
-#endif
 
 static inline void prep_multishot_accept_direct(struct io_uring_sqe *sqe, int fd) {
     sqe_copy_64(sqe, &SQE_TEMPLATE_ACCEPT);
     sqe->fd = fd;
-    /* user_data is constant in template */
 }
 
 static inline void prep_recv_multishot_direct(struct io_uring_sqe *sqe, int fd) {
@@ -334,7 +368,7 @@ static inline void prep_recv_multishot_direct(struct io_uring_sqe *sqe, int fd) 
 static inline void prep_send_direct(struct io_uring_sqe *sqe, int fd,
                                      const void *buf, uint32_t len,
                                      uint16_t buf_idx) {
-    (void)buf; (void)len;  /* Template has pre-set addr and len */
+    (void)buf; (void)len;
     sqe_copy_64(sqe, &SQE_TEMPLATE_SEND);
     sqe->fd = fd;
     sqe->user_data = OP_SEND_SHIFTED | (uint32_t)fd | ((uint64_t)buf_idx << 40);
@@ -345,6 +379,8 @@ static inline void prep_close_direct(struct io_uring_sqe *sqe, int fd) {
     sqe->fd = fd;
     sqe->user_data = OP_CLOSE_SHIFTED | (uint32_t)fd;
 }
+
+#endif  /* USE_AVX2 / scalar */
 
 #endif  /* USE_AVX512 */
 
