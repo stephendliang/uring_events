@@ -114,6 +114,9 @@ enum op_type {
     OP_SEND       = 2,
     OP_CLOSE      = 3,
     OP_SETSOCKOPT = 4,
+#ifdef ENABLE_ZC
+    OP_SEND_ZC    = 5,
+#endif
 };
 
 /* Pre-shifted operation codes for faster encoding */
@@ -122,6 +125,9 @@ enum op_type {
 #define OP_SEND_SHIFTED       ((uint64_t)OP_SEND << 32)
 #define OP_CLOSE_SHIFTED      ((uint64_t)OP_CLOSE << 32)
 #define OP_SETSOCKOPT_SHIFTED ((uint64_t)OP_SETSOCKOPT << 32)
+#ifdef ENABLE_ZC
+#define OP_SEND_ZC_SHIFTED    ((uint64_t)OP_SEND_ZC << 32)
+#endif
 
 /* ============================================================================
  * SQE templates - 64-byte aligned for SIMD copy
@@ -199,6 +205,45 @@ static const struct io_uring_sqe SQE_TEMPLATE_CLOSE = {
     .addr3 = 0,
     .__pad2 = {0},
 };
+
+#ifdef ENABLE_ZC
+/* ZC buffer group ID - distinct from recv buffer group */
+#ifndef ZC_BUFFER_GROUP_ID
+#define ZC_BUFFER_GROUP_ID      1
+#endif
+#ifndef ZC_NUM_BUFFERS
+#define ZC_NUM_BUFFERS          1024
+#endif
+#ifndef ZC_BUFFER_SIZE
+#define ZC_BUFFER_SIZE          4096
+#endif
+#ifndef ZC_BUFFER_SHIFT
+#define ZC_BUFFER_SHIFT         12  /* log2(ZC_BUFFER_SIZE) */
+#endif
+
+_Static_assert((ZC_NUM_BUFFERS & (ZC_NUM_BUFFERS - 1)) == 0,
+               "ZC_NUM_BUFFERS must be power of 2");
+_Static_assert((1 << ZC_BUFFER_SHIFT) == ZC_BUFFER_SIZE,
+               "ZC_BUFFER_SHIFT must match ZC_BUFFER_SIZE");
+
+__attribute__((aligned(64)))
+static const struct io_uring_sqe SQE_TEMPLATE_SEND_ZC = {
+    .opcode = IORING_OP_SEND_ZC,
+    .flags = IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT,
+    .ioprio = IORING_RECVSEND_BUNDLE,
+    .fd = 0,
+    .off = 0,
+    .addr = 0,
+    .len = 0,
+    .msg_flags = 0,
+    .user_data = 0,
+    .buf_group = ZC_BUFFER_GROUP_ID,
+    .personality = 0,
+    .splice_fd_in = 0,
+    .addr3 = 0,
+    .__pad2 = {0},
+};
+#endif /* ENABLE_ZC */
 
 /* ============================================================================
  * Connection state - bit-packed for cache efficiency
@@ -303,6 +348,17 @@ static inline void prep_close_direct(struct io_uring_sqe *sqe, int fd) {
     _mm512_store_si512((__m512i *)sqe, zmm);
 }
 
+#ifdef ENABLE_ZC
+static inline void prep_send_zc_direct(struct io_uring_sqe *sqe, int fd,
+                                        uint16_t buf_idx) {
+    __m512i zmm = _mm512_load_si512((const __m512i *)&SQE_TEMPLATE_SEND_ZC);
+    zmm = _mm512_mask_set1_epi32(zmm, 1U << 1, fd);
+    uint64_t ud = OP_SEND_ZC_SHIFTED | (uint32_t)fd | ((uint64_t)buf_idx << 40);
+    zmm = _mm512_mask_set1_epi64(zmm, 1U << 4, (long long)ud);
+    _mm512_store_si512((__m512i *)sqe, zmm);
+}
+#endif
+
 #else  /* AVX2 or scalar fallback */
 
 #ifdef USE_AVX2
@@ -348,6 +404,19 @@ static inline void prep_close_direct(struct io_uring_sqe *sqe, int fd) {
     _mm256_store_si256((__m256i *)sqe + 1, hi);
 }
 
+#ifdef ENABLE_ZC
+static inline void prep_send_zc_direct(struct io_uring_sqe *sqe, int fd,
+                                        uint16_t buf_idx) {
+    __m256i lo = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_SEND_ZC);
+    __m256i hi = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_SEND_ZC + 1);
+    lo = _mm256_blend_epi32(lo, _mm256_set1_epi32(fd), 1 << 1);
+    uint64_t ud = OP_SEND_ZC_SHIFTED | (uint32_t)fd | ((uint64_t)buf_idx << 40);
+    hi = _mm256_blend_epi32(hi, _mm256_set1_epi64x((long long)ud), 0x03);
+    _mm256_store_si256((__m256i *)sqe, lo);
+    _mm256_store_si256((__m256i *)sqe + 1, hi);
+}
+#endif
+
 #else  /* Scalar fallback */
 
 static inline void sqe_copy_64(struct io_uring_sqe *dst,
@@ -380,6 +449,15 @@ static inline void prep_close_direct(struct io_uring_sqe *sqe, int fd) {
     sqe->fd = fd;
     sqe->user_data = OP_CLOSE_SHIFTED | (uint32_t)fd;
 }
+
+#ifdef ENABLE_ZC
+static inline void prep_send_zc_direct(struct io_uring_sqe *sqe, int fd,
+                                        uint16_t buf_idx) {
+    sqe_copy_64(sqe, &SQE_TEMPLATE_SEND_ZC);
+    sqe->fd = fd;
+    sqe->user_data = OP_SEND_ZC_SHIFTED | (uint32_t)fd | ((uint64_t)buf_idx << 40);
+}
+#endif
 
 #endif  /* USE_AVX2 / scalar */
 
@@ -472,6 +550,13 @@ static int set_cpu_affinity(int cpu) {
 
 struct server_ctx {
     struct uring ring;
+    struct buf_ring_mgr br_mgr;
+    struct buf_ring_group *recv_grp;    /* Pointer into br_mgr.groups[0] */
+#ifdef ENABLE_ZC
+    struct buf_ring_group *zc_grp;      /* Pointer into br_mgr.groups[1] */
+    bool zc_enabled;
+#endif
+    /* Legacy buf_ring for hot path caching (populated from recv_grp) */
     struct buf_ring br;
     int listen_fd;
     sig_atomic_t running;  /* Proper type for signal handlers */
@@ -560,6 +645,57 @@ static inline bool queue_setsockopt_nodelay(struct server_ctx *ctx, int fd) {
                            &g_tcp_nodelay_val, sizeof(g_tcp_nodelay_val));
     return true;
 }
+
+#ifdef ENABLE_ZC
+static inline bool queue_send_zc(struct server_ctx *ctx, int fd,
+                                  const void *data, uint32_t len) {
+    struct conn_state *c = get_conn(fd);
+    if (unlikely(!c) || c->closing)
+        return false;
+
+    uint16_t buf_idx = buf_ring_zc_alloc(ctx->zc_grp);
+    if (unlikely(buf_idx == UINT16_MAX)) {
+        LOG_WARN("zc: no buffers fd=%d", fd);
+        return false;
+    }
+
+    void *buf = buf_ring_mgr_addr(&ctx->br_mgr, ctx->zc_grp, buf_idx);
+    uint32_t copy_len = (len > ZC_BUFFER_SIZE) ? ZC_BUFFER_SIZE : len;
+    memcpy(buf, data, copy_len);
+
+    buf_ring_zc_push(&ctx->br_mgr, ctx->zc_grp, buf_idx, copy_len);
+    buf_ring_mgr_sync(&ctx->br_mgr, ctx->zc_grp);
+
+    struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
+    if (unlikely(!sqe)) {
+        LOG_ERROR("zc: SQ full fd=%d", fd);
+        return false;
+    }
+
+    prep_send_zc_direct(sqe, fd, buf_idx);
+    return true;
+}
+
+static inline void handle_send_zc(struct server_ctx *ctx,
+                                   struct io_uring_cqe *cqe, int fd) {
+    uint16_t buf_idx = decode_buf_idx(cqe->user_data);
+
+    if (cqe->flags & IORING_CQE_F_NOTIF) {
+        /* Notification: buffer safe to reuse */
+        buf_ring_zc_recycle(ctx->zc_grp, buf_idx);
+        return;
+    }
+
+    /* Completion: send done, buffer still in-flight to NIC */
+    int res = cqe->res;
+    if (unlikely(res < 0)) {
+        if (res != -EPIPE && res != -ECONNRESET && res != -EBADF && res != -ECANCELED)
+            LOG_ERROR("zc send error %d fd=%d", res, fd);
+        queue_close(ctx, fd);
+    }
+    /* Do NOT recycle - wait for NOTIF */
+}
+#endif /* ENABLE_ZC */
 
 static inline void handle_setsockopt(struct server_ctx *ctx,
                                       struct io_uring_cqe *cqe, int fd) {
@@ -739,6 +875,11 @@ static void event_loop(struct server_ctx *ctx) {
             case OP_SETSOCKOPT:
                 handle_setsockopt(ctx, cqe, fd);
                 break;
+#ifdef ENABLE_ZC
+            case OP_SEND_ZC:
+                handle_send_zc(ctx, cqe, fd);
+                break;
+#endif
             default:
                 LOG_BUG("unknown op %u", op);
                 break;
@@ -749,6 +890,7 @@ static void event_loop(struct server_ctx *ctx) {
 
         /* Write back cached tail and sync if buffers were recycled */
         ctx->br.tail = br_tail;
+        ctx->recv_grp->tail = br_tail;  /* Keep recv_grp in sync */
         if (br_tail != br_tail_start)
             buf_ring_sync(&ctx->br);
         smp_store_release(cq->khead, head);
@@ -824,11 +966,44 @@ int main(int argc, char *argv[]) {
     }
     LOG_INFO("io_uring features: 0x%x", ctx.ring.features);
 
-    ret = buf_ring_init(&ctx.ring, &ctx.br);
+    /* Initialize unified buffer ring manager */
+    struct buf_ring_config configs[] = {
+        { .num_buffers = NUM_BUFFERS, .buffer_size = BUFFER_SIZE,
+          .buffer_shift = BUFFER_SHIFT, .bgid = BUFFER_GROUP_ID,
+#ifdef ENABLE_ZC
+          .is_zc = 0
+#endif
+        },
+#ifdef ENABLE_ZC
+        { .num_buffers = ZC_NUM_BUFFERS, .buffer_size = ZC_BUFFER_SIZE,
+          .buffer_shift = ZC_BUFFER_SHIFT, .bgid = ZC_BUFFER_GROUP_ID,
+          .is_zc = 1 },
+#endif
+    };
+    ret = buf_ring_mgr_init(&ctx.ring, &ctx.br_mgr, configs,
+                             sizeof(configs)/sizeof(configs[0]));
     if (ret < 0) {
-        LOG_FATAL("buffer ring init: %d", ret);
+        LOG_FATAL("buffer ring manager init: %d", ret);
         return 1;
     }
+    ctx.recv_grp = &ctx.br_mgr.groups[0];
+#ifdef ENABLE_ZC
+    ctx.zc_grp = &ctx.br_mgr.groups[1];
+    /* Probe for ZC support */
+    ret = buf_ring_zc_probe(&ctx.ring);
+    ctx.zc_enabled = (ret == 0);
+    if (ctx.zc_enabled) {
+        LOG_INFO("Zerocopy send enabled");
+    } else {
+        LOG_INFO("Zerocopy send not available (ret=%d)", ret);
+    }
+#endif
+
+    /* Setup legacy buf_ring struct for hot path (points into br_mgr) */
+    ctx.br.br = BUF_RING_PTR(&ctx.br_mgr, ctx.recv_grp);
+    ctx.br.buf_base = BUF_RING_DATA(&ctx.br_mgr, ctx.recv_grp);
+    ctx.br.tail = ctx.recv_grp->tail;
+    ctx.br.mask = ctx.recv_grp->mask;
 
     int listen_fd = create_listen_socket(port, cpu);
     if (listen_fd < 0) {
@@ -864,6 +1039,9 @@ int main(int argc, char *argv[]) {
     LOG_INFO("Listening on port %d (fixed file index 0)", port);
 
     event_loop(&ctx);
+
+    /* Cleanup buffer ring manager (unregisters from kernel, single munmap) */
+    buf_ring_mgr_destroy(&ctx.ring, &ctx.br_mgr);
 
     /* listen_fd is now a fixed file index - gets cleaned up with ring.
      * Only close the ring fd. */
