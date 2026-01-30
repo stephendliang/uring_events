@@ -796,7 +796,7 @@ static inline void handle_close(int fd) {
  * ============================================================================ */
 
 static void event_loop(struct server_ctx *ctx) {
-    struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 };  // 100ms
+    struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 };  // 1ms
 
     if (unlikely(!queue_accept(ctx))) {
         LOG_FATAL("Failed to start accept");
