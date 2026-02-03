@@ -1,5 +1,4 @@
-#ifndef URING_H
-#define URING_H
+#pragma once
 
 #include <stdint.h>
 #include <stdatomic.h>
@@ -13,7 +12,7 @@
 #include <linux/io_uring.h>
 #include <linux/time_types.h>
 
-/* Socket command definitions for async setsockopt (kernel 6.7+) */
+// Socket command definitions for async setsockopt (kernel 6.7+)
 #ifndef SOCKET_URING_OP_SETSOCKOPT
 #define SOCKET_URING_OP_SETSOCKOPT 0
 #endif
@@ -22,20 +21,17 @@
 #define IORING_OP_URING_CMD 46
 #endif
 
-/* IORING_SETUP_NO_SQARRAY: added in Linux 6.6, eliminates SQ array indirection */
+// IORING_SETUP_NO_SQARRAY: added in Linux 6.6, eliminates SQ array indirection
 #ifndef IORING_SETUP_NO_SQARRAY
 #define IORING_SETUP_NO_SQARRAY (1U << 16)
 #endif
 
-/* IORING_FILE_INDEX_ALLOC: kernel allocates fixed file slot (direct accept) */
+// IORING_FILE_INDEX_ALLOC: kernel allocates fixed file slot (direct accept)
 #ifndef IORING_FILE_INDEX_ALLOC
 #define IORING_FILE_INDEX_ALLOC (~0U)
 #endif
 
-/* ============================================================================
- * Zerocopy constants (kernel 6.10+)
- * ============================================================================ */
-
+// Zerocopy constants (kernel 6.10+)
 #ifndef IORING_OP_SEND_ZC
 #define IORING_OP_SEND_ZC 53
 #endif
@@ -48,21 +44,15 @@
 #define IORING_CQE_F_NOTIF (1U << 3)
 #endif
 
-/* ============================================================================
- * Buffer ring configuration
- * ============================================================================ */
-
+// Buffer ring configuration limits
 #define BUF_RING_MAX_GROUPS     4
 #define BUF_RING_MAX_BUFFERS    8192
 
-/* ============================================================================
- * Memory barriers - x86-TSO optimized
- * On x86, loads are not reordered with other loads, stores are not reordered
- * with other stores. We only need compiler barriers + volatile for acquire/release.
- * ============================================================================ */
-
+/* Memory barriers - x86-TSO optimized
+   x86 loads are not reordered with other loads, stores are not reordered
+   with other stores. We only need compiler barriers + volatile for acquire/release. */
 #if defined(__x86_64__) || defined(__i386__)
-  /* x86 has strong memory model - compiler barrier is sufficient */
+  // x86 has strong memory model - compiler barrier is sufficient
   #define smp_load_acquire(p) ({              \
       typeof(*(p)) ___v = *(volatile typeof(*(p)) *)(p); \
       __asm__ __volatile__("" ::: "memory");  \
@@ -73,7 +63,7 @@
       *(volatile typeof(*(p)) *)(p) = (v);    \
   } while (0)
 #else
-  /* Generic - use full atomic fences */
+  // Generic (ARM, RISC-V) - use full atomic fences
   #define smp_load_acquire(p) ({                              \
       typeof(*(p)) ___v = *(volatile typeof(*(p)) *)(p);      \
       __atomic_thread_fence(__ATOMIC_ACQUIRE);                \
@@ -85,47 +75,44 @@
   } while (0)
 #endif
 
-/* ============================================================================
- * Ring structures - cache-line optimized layout
- * ============================================================================ */
-
+// Ring structures - cache-line optimized layout
 struct uring_sq {
-    /* Kernel-shared pointers - read frequently */
-    uint32_t *khead;            /* Consumer head (kernel updates) */
-    uint32_t *ktail;            /* Producer tail (we update) */
-    uint32_t *kring_mask;       /* Cached on init */
-    uint32_t *kring_entries;    /* Cached on init */
-    uint32_t *array;            /* SQE index array */
-    struct io_uring_sqe *sqes;  /* SQE array */
+    // Kernel-shared pointers - read frequently
+    u32 *khead;            // Consumer head (kernel updates)
+    u32 *ktail;            // Producer tail (we update)
+    u32 *kring_mask;       // Cached on init
+    u32 *kring_entries;    // Cached on init
+    u32 *array;            // SQE index array
+    struct io_uring_sqe *sqes;  // SQE array
 
-    /* Local state - not shared with kernel */
-    uint32_t ring_mask;         /* Cached from *kring_mask */
-    uint32_t ring_entries;      /* Cached from *kring_entries */
-    uint32_t sqe_head;          /* Our head for tracking submissions */
-    uint32_t sqe_tail;          /* Our tail for tracking submissions */
-    uint32_t cached_khead;      /* Cached kernel head - avoid repeated loads */
+    // Local state - not shared with kernel
+    u32 ring_mask;         // Cached from *kring_mask
+    u32 ring_entries;      // Cached from *kring_entries
+    u32 sqe_head;          // Our head for tracking submissions
+    u32 sqe_tail;          // Our tail for tracking submissions
+    u32 cached_khead;      // Cached kernel head - avoid repeated loads
 
-    /* Init-time only */
-    uint32_t *kflags;
-    uint32_t *kdropped;
+    // Init-time only
+    u32 *kflags;
+    u32 *kdropped;
     size_t ring_sz;
     void *ring_ptr;
 };
 
 struct uring_cq {
-    /* Kernel-shared pointers */
-    uint32_t *khead;            /* Consumer head (we update) */
-    uint32_t *ktail;            /* Producer tail (kernel updates) */
-    struct io_uring_cqe *cqes;  /* CQE array */
+    // Kernel-shared pointers
+    u32 *khead;            // Consumer head (we update)
+    u32 *ktail;            // Producer tail (kernel updates)
+    struct io_uring_cqe *cqes;  // CQE array
 
-    /* Cached values */
-    uint32_t ring_mask;
+    // Cached values
+    u32 ring_mask;
 
-    /* Init-time only */
-    uint32_t *kring_mask;
-    uint32_t *kring_entries;
-    uint32_t *kflags;
-    uint32_t *koverflow;
+    // Init-time only
+    u32 *kring_mask;
+    u32 *kring_entries;
+    u32 *kflags;
+    u32 *koverflow;
     size_t ring_sz;
     void *ring_ptr;
 };
@@ -134,87 +121,73 @@ struct uring {
     struct uring_sq sq;
     struct uring_cq cq;
     int ring_fd;
-    uint32_t features;
-    uint32_t flags;  /* Accepted setup flags */
+    u32 features;
+    u32 flags;  // Accepted setup flags
 };
 
-/* ============================================================================
- * Unified buffer ring system - supports multiple groups in single mmap
- * ============================================================================ */
-
-/* Configuration for a single buffer group */
+// Unified buffer ring system - supports multiple groups in single mmap
+// Configuration for a single buffer group
 struct buf_ring_config {
-    uint16_t num_buffers;       /* Must be power of 2, max BUF_RING_MAX_BUFFERS */
-    uint16_t bgid;              /* Buffer group ID for kernel registration */
-    uint32_t buffer_size;       /* Size of each buffer */
-    uint32_t buffer_shift;      /* log2(buffer_size) for fast address calc */
+    u16 num_buffers;       // Must be power of 2, max BUF_RING_MAX_BUFFERS
+    u16 bgid;              // Buffer group ID for kernel registration
+    u32 buffer_size;       // Size of each buffer
+    u32 buffer_shift;      // log2(buffer_size) for fast address calc
 #ifdef ENABLE_ZC
-    uint8_t is_zc;              /* Zerocopy mode (bitmap tracking) */
+    u8 is_zc;              // Zerocopy mode (bitmap tracking)
 #endif
 };
 
-/* Per-group descriptor - offsets into shared allocation */
+// Per-group descriptor - offsets into shared allocation
 struct buf_ring_group {
-    uint16_t tail;              /* Local tail for ring operations */
-    uint16_t mask;              /* num_buffers - 1 */
-    uint16_t bgid;              /* Buffer group ID */
-    uint16_t num_buffers;       /* Number of buffers in this group */
-    uint32_t buffer_size;       /* Size of each buffer */
-    uint32_t buffer_shift;      /* log2(buffer_size) */
-    uint32_t ring_offset;       /* Offset into shared mmap for ring header */
-    uint32_t data_offset;       /* Offset into shared mmap for buffer data */
+    u16 tail;              // Local tail for ring operations
+    u16 mask;              // num_buffers - 1
+    u16 bgid;              // Buffer group ID
+    u16 num_buffers;       // Number of buffers in this group
+    u32 buffer_size;       // Size of each buffer
+    u32 buffer_shift;      // log2(buffer_size)
+    u32 ring_offset;       // Offset into shared mmap for ring header
+    u32 data_offset;       // Offset into shared mmap for buffer data
 #ifdef ENABLE_ZC
-    uint8_t is_zc;              /* Zerocopy mode flag */
-    uint16_t free_count;        /* Number of free buffers (ZC only) */
-    uint64_t free_bitmap[BUF_RING_MAX_BUFFERS / 64];  /* 1=free, 0=in-flight */
+    u8 is_zc;              // Zerocopy mode flag
+    u16 free_count;        // Number of free buffers (ZC only)
+    uint64_t free_bitmap[BUF_RING_MAX_BUFFERS / 64];  // 1=free, 0=in-flight
 #endif
 };
 
-/* Unified buffer ring manager - single mmap for all groups */
+// Unified buffer ring manager - single mmap for all groups
 struct buf_ring_mgr {
-    void *base;                 /* Single mmap base address */
-    size_t total_size;          /* Total mmap size */
+    void *base;                 // Single mmap base address
+    size_t total_size;          // Total mmap size
     struct buf_ring_group groups[BUF_RING_MAX_GROUPS];
-    uint8_t num_groups;         /* Currently registered groups */
+    u8 num_groups;         // Currently registered groups
 };
 
-/* Legacy single-group struct for backwards compatibility */
+// Legacy single-group struct for backwards compatibility
 struct buf_ring {
     struct io_uring_buf_ring *br;
-    uint8_t *buf_base;
-    uint16_t tail;
-    uint16_t mask;              /* NUM_BUFFERS - 1, cached */
+    u8 *buf_base;
+    u16 tail;
+    u16 mask;              // NUM_BUFFERS - 1, cached
 };
 
-/* ============================================================================
- * Buffer ring accessor macros - fast, no function call overhead
- * ============================================================================ */
-
+// Buffer ring accessor macros - fast, no function call overhead
 #define BUF_RING_PTR(mgr, grp) \
     ((struct io_uring_buf_ring *)((char*)(mgr)->base + (grp)->ring_offset))
 
 #define BUF_RING_DATA(mgr, grp) \
-    ((uint8_t *)((char*)(mgr)->base + (grp)->data_offset))
+    ((u8 *)((char*)(mgr)->base + (grp)->data_offset))
 
 #define BUF_RING_ADDR(mgr, grp, idx) \
-    (BUF_RING_DATA(mgr, grp) + ((uint32_t)(idx) << (grp)->buffer_shift))
+    (BUF_RING_DATA(mgr, grp) + ((u32)(idx) << (grp)->buffer_shift))
 
-/* ============================================================================
- * io_uring syscall wrappers (no liburing)
- * ============================================================================ */
+// syscall wrappers; no liburing
+#define io_uring_setup(entries, params) \
+    (int)syscall(__NR_io_uring_setup, entries, params)
 
-static inline int io_uring_setup(unsigned entries, struct io_uring_params *p) {
-    return (int)syscall(__NR_io_uring_setup, entries, p);
-}
+#define io_uring_register(fd, opcode, arg, nr_args) \
+    (int)syscall(__NR_io_uring_register, fd, opcode, arg, nr_args)
 
-static inline int io_uring_register(int fd, unsigned opcode, void *arg, unsigned nr_args) {
-    return (int)syscall(__NR_io_uring_register, fd, opcode, arg, nr_args);
-}
-
-/* ============================================================================
- * io_uring initialization
- * ============================================================================ */
-
+// io_uring initialization
 static int uring_mmap(struct uring *ring, struct io_uring_params *p) {
     struct uring_sq *sq = &ring->sq;
     struct uring_cq *cq = &ring->cq;
@@ -222,12 +195,11 @@ static int uring_mmap(struct uring *ring, struct io_uring_params *p) {
     int ret;
 
     /* SQ ring mapping.
-     * With SINGLE_MMAP (common), SQ and CQ share one mapping.
-     * With NO_SQARRAY, sq_off.array is 0, so use CQ end as size. */
+       With NO_SQARRAY, sq_off.array is 0, so use CQ end as size. */
     if (p->flags & IORING_SETUP_NO_SQARRAY)
         size = p->cq_off.cqes + p->cq_entries * sizeof(struct io_uring_cqe);
     else
-        size = p->sq_off.array + p->sq_entries * sizeof(uint32_t);
+        size = p->sq_off.array + p->sq_entries * sizeof(u32);
     sq->ring_sz = size;
     sq->ring_ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
                         MAP_SHARED | MAP_POPULATE, ring->ring_fd,
@@ -235,7 +207,8 @@ static int uring_mmap(struct uring *ring, struct io_uring_params *p) {
     if (unlikely(sq->ring_ptr == MAP_FAILED))
         return -errno;
 
-    /* CQ ring mapping */
+    // CQ ring mapping
+    // With SINGLE_MMAP (common), SQ and CQ share one map.
     if (p->features & IORING_FEAT_SINGLE_MMAP) {
         cq->ring_ptr = sq->ring_ptr;
         cq->ring_sz = 0;
@@ -252,7 +225,7 @@ static int uring_mmap(struct uring *ring, struct io_uring_params *p) {
         }
     }
 
-    /* SQE array mapping */
+    // SQE array mapping
     size = p->sq_entries * sizeof(struct io_uring_sqe);
     sq->sqes = mmap(NULL, size, PROT_READ | PROT_WRITE,
                     MAP_SHARED | MAP_POPULATE, ring->ring_fd,
@@ -265,29 +238,29 @@ static int uring_mmap(struct uring *ring, struct io_uring_params *p) {
         return ret;
     }
 
-    /* Setup SQ pointers */
+    // Setup SQ pointers
     sq->khead = sq->ring_ptr + p->sq_off.head;
     sq->ktail = sq->ring_ptr + p->sq_off.tail;
     sq->kring_mask = sq->ring_ptr + p->sq_off.ring_mask;
     sq->kring_entries = sq->ring_ptr + p->sq_off.ring_entries;
     sq->kflags = sq->ring_ptr + p->sq_off.flags;
     sq->kdropped = sq->ring_ptr + p->sq_off.dropped;
-    /* Cache frequently-used values */
+    // Cache frequently-used values
     sq->ring_mask = *sq->kring_mask;
     sq->ring_entries = *sq->kring_entries;
-    sq->cached_khead = 0;       /* Kernel starts at 0 */
+    sq->cached_khead = 0; // Kernel starts at 0
 
     if (!(p->flags & IORING_SETUP_NO_SQARRAY)) {
         sq->array = sq->ring_ptr + p->sq_off.array;
         /* Pre-fill SQ array with identity mapping.
-         * Since we use SINGLE_ISSUER, sequential allocation, and contiguous submission,
-         * array[n % size] = n % size is always correct. This enables O(1) submit. */
-        for (uint32_t i = 0; i < sq->ring_entries; i++) {
+           Since we use SINGLE_ISSUER, sequential allocation, and contiguous submission,
+           array[n % size] = n % size is always correct. This enables O(1) submit. */
+        for (u32 i = 0; i < sq->ring_entries; i++) {
             sq->array[i] = i;
         }
     }
 
-    /* Setup CQ pointers */
+    // Setup CQ pointers
     cq->khead = cq->ring_ptr + p->cq_off.head;
     cq->ktail = cq->ring_ptr + p->cq_off.tail;
     cq->kring_mask = cq->ring_ptr + p->cq_off.ring_mask;
@@ -296,7 +269,7 @@ static int uring_mmap(struct uring *ring, struct io_uring_params *p) {
     cq->koverflow = cq->ring_ptr + p->cq_off.overflow;
     cq->cqes = cq->ring_ptr + p->cq_off.cqes;
 
-    /* Cache ring mask */
+    // Cache ring mask
     cq->ring_mask = *cq->kring_mask;
 
     return 0;
@@ -308,7 +281,6 @@ static int uring_init(struct uring *ring) {
 
     memset(&p, 0, sizeof(p));
     memset(ring, 0, sizeof(*ring));
-
     p.flags = IORING_SETUP_SUBMIT_ALL |
               IORING_SETUP_SINGLE_ISSUER |
               IORING_SETUP_DEFER_TASKRUN |
@@ -320,7 +292,7 @@ static int uring_init(struct uring *ring) {
     ring->ring_fd = io_uring_setup(SQ_ENTRIES, &p);
     if (ring->ring_fd < 0 && errno == EINVAL) {
         /* Kernel may not support NO_SQARRAY, retry without it.
-         * Reset p fully since kernel may have partially modified it. */
+           Reset p fully since kernel may have partially modified it. */
         memset(&p, 0, sizeof(p));
         p.flags = IORING_SETUP_SUBMIT_ALL |
                   IORING_SETUP_SINGLE_ISSUER |
@@ -334,7 +306,7 @@ static int uring_init(struct uring *ring) {
         return -errno;
 
     ring->features = p.features;
-    ring->flags = p.flags;  /* Store what kernel accepted */
+    ring->flags = p.flags;  // Store what kernel accepted
 
     ret = uring_mmap(ring, &p);
     if (unlikely(ret < 0)) {
@@ -345,17 +317,14 @@ static int uring_init(struct uring *ring) {
     return 0;
 }
 
-/* ============================================================================
- * SQE acquisition - OPTIMIZED: no memset, minimal work
- * ============================================================================ */
-
+// SQE fetch - OPTIMIZED: no memset, minimal work
 static inline struct io_uring_sqe *uring_get_sqe(struct uring *ring) {
     struct uring_sq *sq = &ring->sq;
-    uint32_t next = sq->sqe_tail + 1;
+    u32 next = sq->sqe_tail + 1;
 
-    /* Fast path: check against cached head (no memory barrier needed) */
+    // Fast path: check against cached head (no memory barrier needed)
     if (unlikely(next - sq->cached_khead > sq->ring_entries)) {
-        /* Slow path: ring looks full, reload head from kernel */
+        // Slow path: ring looks full, reload head from kernel
         sq->cached_khead = smp_load_acquire(sq->khead);
         if (next - sq->cached_khead > sq->ring_entries)
             return NULL;
@@ -364,21 +333,21 @@ static inline struct io_uring_sqe *uring_get_sqe(struct uring *ring) {
     struct io_uring_sqe *sqe = &sq->sqes[sq->sqe_tail & sq->ring_mask];
     sq->sqe_tail = next;
 
-    /* NO MEMSET - caller must initialize all required fields */
+    // NO MEMSET - caller must initialize all required fields explicitly
     return sqe;
 }
 
 /* O(1) submit - relies on identity mapping array[n] = n pre-filled at init.
- * Invariant: ktail == sqe_head at entry (proven in SQE_OPTIMIZATION.md).
- * Requirements: SINGLE_ISSUER, sequential allocation, contiguous submission. */
+   Invariant: ktail == sqe_head at entry (proven in SQE_OPTIMIZATION.md).
+   Requirements: SINGLE_ISSUER, sequential allocation, contiguous submission. */
 static inline int uring_submit(struct uring *ring) {
     struct uring_sq *sq = &ring->sq;
-    uint32_t to_submit = sq->sqe_tail - sq->sqe_head;
+    u32 to_submit = sq->sqe_tail - sq->sqe_head;
 
     if (!to_submit)
         return 0;
 
-    /* Invariant: *ktail == sqe_head, so new ktail = sqe_head + to_submit = sqe_tail */
+    // Invariant: *ktail == sqe_head, so new ktail = sqe_head + to_submit = sqe_tail
     smp_store_release(sq->ktail, sq->sqe_tail);
     sq->sqe_head = sq->sqe_tail;
 
@@ -392,7 +361,7 @@ static inline int uring_submit_and_wait(struct uring *ring,
     unsigned flags = IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG;
 
     /* Pre-zeroed template avoids memset on every iteration.
-     * Only sigmask_sz and ts need values; rest must be 0 for kernel. */
+       Only sigmask_sz and ts need values; rest must be 0 for kernel. */
     struct io_uring_getevents_arg arg = {
         .sigmask = 0,
         .sigmask_sz = _NSIG / 8,
@@ -412,17 +381,14 @@ static inline int uring_submit_and_wait(struct uring *ring,
     return to_submit;
 }
 
-/* ============================================================================
- * Provided buffer ring (legacy single-group API)
- * ============================================================================ */
-
+// Provided buffer ring (legacy single-group API)
 __attribute__((unused))
 static int buf_ring_init(struct uring *ring, struct buf_ring *br) {
     size_t ring_entries_size = sizeof(struct io_uring_buf) * NUM_BUFFERS;
     size_t buffers_size = (size_t)BUFFER_SIZE * NUM_BUFFERS;
     size_t total_size = ring_entries_size + buffers_size;
 
-    /* Try huge pages first */
+    // Attempt huge pages
     void *ptr = mmap(NULL, total_size, PROT_READ | PROT_WRITE,
                      MAP_ANONYMOUS | MAP_PRIVATE | MAP_HUGETLB, -1, 0);
     if (ptr == MAP_FAILED) {
@@ -434,17 +400,17 @@ static int buf_ring_init(struct uring *ring, struct buf_ring *br) {
     }
 
     br->br = ptr;
-    br->buf_base = (uint8_t *)ptr + ring_entries_size;
+    br->buf_base = (u8 *)ptr + ring_entries_size;
     br->tail = 0;
     br->mask = NUM_BUFFERS - 1;
 
-    /* Initialize buffer entries using pointer arithmetic (no multiplication) */
-    uint8_t *buf_ptr = br->buf_base;
-    for (uint32_t i = 0; i < NUM_BUFFERS; i++) {
+    // Initialize buffer entries using pointer arithmetic (no multiplication)
+    u8 *buf_ptr = br->buf_base;
+    for (u32 i = 0; i < NUM_BUFFERS; i++) {
         struct io_uring_buf *buf = &br->br->bufs[br->tail & br->mask];
         buf->addr = (uint64_t)buf_ptr;
         buf->len = BUFFER_SIZE;
-        buf->bid = (uint16_t)i;
+        buf->bid = (u16)i;
         br->tail++;
         buf_ptr += BUFFER_SIZE;
     }
@@ -466,54 +432,48 @@ static int buf_ring_init(struct uring *ring, struct buf_ring *br) {
 }
 
 /* Hot path - inline, no validation in production
- * IMPORTANT: Does NOT issue memory barrier. Caller MUST call buf_ring_sync()
- * after batching recycles to make buffers visible to kernel. */
-static inline void buf_ring_recycle(struct buf_ring *br, uint16_t bid) {
+   IMPORTANT: Does NOT issue memory barrier. Caller MUST call buf_ring_sync()
+   after batching recycles to make buffers visible to kernel. */
+static inline void buf_ring_recycle(struct buf_ring *br, u16 bid) {
     DEBUG_ONLY(if (bid > br->mask) { LOG_BUG("invalid bid %u", bid); return; });
 
-    uint16_t tail = br->tail;
+    u16 tail = br->tail;
     struct io_uring_buf *buf = &br->br->bufs[tail & br->mask];
 
-    /* Use shift instead of multiply */
-    buf->addr = (uint64_t)(br->buf_base + ((uint32_t)bid << BUFFER_SHIFT));
+    // Use shift instead of multiply
+    buf->addr = (uint64_t)(br->buf_base + ((u32)bid << BUFFER_SHIFT));
     buf->len = BUFFER_SIZE;
     buf->bid = bid;
 
     br->tail = tail + 1;
-    /* NO barrier - call buf_ring_sync() after batch */
+    // NO barrier - call buf_ring_sync() after batch
 }
 
-/* Publish recycled buffers to kernel. Call once after batch of buf_ring_recycle(). */
+// Publish recycled buffers to kernel. Call once after batch of buf_ring_recycle()
 static inline void buf_ring_sync(struct buf_ring *br) {
     smp_store_release(&br->br->tail, br->tail);
 }
 
-/* ============================================================================
- * Fixed file registration for direct accept
- * ============================================================================ */
-
-static int uring_register_fixed_files(struct uring *ring, uint32_t count) {
-    /* Allocate sparse fd array - all slots start empty (-1) */
+// Fixed file registration for direct accept
+static int uring_register_fixed_files(struct uring *ring, u32 count) {
+    // Allocate sparse fd array - all slots initialized to -1
     size_t size = count * sizeof(int);
     int *fds = mmap(NULL, size, PROT_READ | PROT_WRITE,
                     MAP_ANONYMOUS | MAP_PRIVATE | MAP_POPULATE, -1, 0);
     if (fds == MAP_FAILED)
         return -errno;
 
-    memset(fds, -1, size);  /* -1 = empty slot */
+    memset(fds, -1, size);  // -1 = empty slot
 
     int ret = io_uring_register(ring->ring_fd, IORING_REGISTER_FILES, fds, count);
-    munmap(fds, size);  /* Kernel copied it, we can free */
+    munmap(fds, size);  // Kernel copied it, we can free
     return ret;
 }
 
-/* ============================================================================
- * Unified buffer ring manager - coalesced allocation for all groups
- * ============================================================================ */
-
-/* Register a single buffer ring with kernel */
+// Unified buffer ring manager - coalesced allocation for all groups
+// Register a single buffer ring with kernel
 static inline int buf_ring_register(struct uring *ring, void *ring_addr,
-                                     uint16_t num_entries, uint16_t bgid) {
+                                     u16 num_entries, u16 bgid) {
     struct io_uring_buf_reg reg;
     memset(&reg, 0, sizeof(reg));
     reg.ring_addr = (uint64_t)ring_addr;
@@ -522,33 +482,33 @@ static inline int buf_ring_register(struct uring *ring, void *ring_addr,
     return io_uring_register(ring->ring_fd, IORING_REGISTER_PBUF_RING, &reg, 1);
 }
 
-/* Unregister a single buffer ring from kernel */
-static inline int buf_ring_unregister(struct uring *ring, uint16_t bgid) {
+// Unregister a single buffer ring from kernel
+static inline int buf_ring_unregister(struct uring *ring, u16 bgid) {
     struct io_uring_buf_reg reg = { .bgid = bgid };
     return io_uring_register(ring->ring_fd, IORING_UNREGISTER_PBUF_RING, &reg, 1);
 }
 
-/* Initialize buffer ring manager with coalesced allocation for all groups */
+// Initialize buffer ring manager with coalesced allocation for all groups
 static int buf_ring_mgr_init(struct uring *ring, struct buf_ring_mgr *mgr,
                               const struct buf_ring_config *configs,
-                              uint8_t num_configs) {
+                              u8 num_configs) {
     if (num_configs > BUF_RING_MAX_GROUPS)
         return -EINVAL;
 
     memset(mgr, 0, sizeof(*mgr));
 
-    /* Calculate total size needed for all groups */
+    // Calculate total size needed for all groups
     size_t total = 0;
     for (int i = 0; i < num_configs; i++) {
         if (configs[i].num_buffers > BUF_RING_MAX_BUFFERS)
             return -EINVAL;
         if ((configs[i].num_buffers & (configs[i].num_buffers - 1)) != 0)
-            return -EINVAL;  /* Must be power of 2 */
+            return -EINVAL;  // Must be power of 2
         total += sizeof(struct io_uring_buf) * configs[i].num_buffers;
         total += (size_t)configs[i].buffer_size * configs[i].num_buffers;
     }
 
-    /* Single mmap with huge pages */
+    // Attempt mmap with huge pages
     void *ptr = mmap(NULL, total, PROT_READ | PROT_WRITE,
                      MAP_ANONYMOUS | MAP_PRIVATE | MAP_HUGETLB, -1, 0);
     if (ptr == MAP_FAILED) {
@@ -562,15 +522,15 @@ static int buf_ring_mgr_init(struct uring *ring, struct buf_ring_mgr *mgr,
     mgr->base = ptr;
     mgr->total_size = total;
 
-    /* Layout groups sequentially */
+    // Layout groups sequentially
     size_t offset = 0;
     for (int i = 0; i < num_configs; i++) {
         struct buf_ring_group *g = &mgr->groups[i];
         size_t ring_size = sizeof(struct io_uring_buf) * configs[i].num_buffers;
         size_t data_size = (size_t)configs[i].buffer_size * configs[i].num_buffers;
 
-        g->ring_offset = (uint32_t)offset;
-        g->data_offset = (uint32_t)(offset + ring_size);
+        g->ring_offset = (u32)offset;
+        g->data_offset = (u32)(offset + ring_size);
         g->num_buffers = configs[i].num_buffers;
         g->buffer_size = configs[i].buffer_size;
         g->buffer_shift = configs[i].buffer_shift;
@@ -578,11 +538,11 @@ static int buf_ring_mgr_init(struct uring *ring, struct buf_ring_mgr *mgr,
         g->mask = configs[i].num_buffers - 1;
         g->tail = 0;
 
-        /* Register this group with kernel */
+        // Register this group with kernel
         int ret = buf_ring_register(ring, (char*)ptr + g->ring_offset,
                                      g->num_buffers, g->bgid);
         if (ret < 0) {
-            /* Cleanup already registered groups */
+            // Cleanup already registered groups 
             for (int j = 0; j < i; j++)
                 buf_ring_unregister(ring, mgr->groups[j].bgid);
             munmap(ptr, total);
@@ -595,20 +555,20 @@ static int buf_ring_mgr_init(struct uring *ring, struct buf_ring_mgr *mgr,
             g->is_zc = 1;
             g->free_count = g->num_buffers;
             memset(g->free_bitmap, 0xFF, sizeof(g->free_bitmap));
-            /* Clear trailing bits if not power-of-64 aligned */
-            uint16_t trailing = g->num_buffers & 63;
+            // Clear trailing bits if not power-of-64 aligned
+            u16 trailing = g->num_buffers & 63;
             if (trailing)
                 g->free_bitmap[(g->num_buffers - 1) >> 6] &= (1ULL << trailing) - 1;
         } else
 #endif
         {
-            /* Init buffers for recv mode (pre-fill ring) */
+            // Init buffers for recv mode (pre-fill ring)
             struct io_uring_buf_ring *br = BUF_RING_PTR(mgr, g);
-            for (uint32_t j = 0; j < g->num_buffers; j++) {
+            for (u32 j = 0; j < g->num_buffers; j++) {
                 struct io_uring_buf *buf = &br->bufs[g->tail & g->mask];
                 buf->addr = (uint64_t)BUF_RING_ADDR(mgr, g, j);
                 buf->len = g->buffer_size;
-                buf->bid = (uint16_t)j;
+                buf->bid = (u16)j;
                 g->tail++;
             }
             smp_store_release(&br->tail, g->tail);
@@ -621,7 +581,7 @@ static int buf_ring_mgr_init(struct uring *ring, struct buf_ring_mgr *mgr,
     return 0;
 }
 
-/* Cleanup - single munmap for all groups */
+// Cleanup - single munmap for all groups
 static inline void buf_ring_mgr_destroy(struct uring *ring,
                                          struct buf_ring_mgr *mgr) {
     for (int i = 0; i < mgr->num_groups; i++) {
@@ -634,13 +594,10 @@ static inline void buf_ring_mgr_destroy(struct uring *ring,
     mgr->num_groups = 0;
 }
 
-/* ============================================================================
- * Unified buffer ring operations - work with buf_ring_group
- * ============================================================================ */
-
-/* Recycle a buffer back to the ring (recv mode) */
+// Unified buffer ring operations - work with buf_ring_group
+// Recycle a buffer back to the ring (recv mode)
 static inline void buf_ring_mgr_recycle(struct buf_ring_mgr *mgr,
-                                         struct buf_ring_group *g, uint16_t bid) {
+                                         struct buf_ring_group *g, u16 bid) {
     DEBUG_ONLY(if (bid > g->mask) { LOG_BUG("invalid bid %u", bid); return; });
 
     struct io_uring_buf_ring *br = BUF_RING_PTR(mgr, g);
@@ -651,52 +608,40 @@ static inline void buf_ring_mgr_recycle(struct buf_ring_mgr *mgr,
     g->tail++;
 }
 
-/* Sync buffer ring tail to kernel */
+// Sync buffer ring tail to kernel
 static inline void buf_ring_mgr_sync(struct buf_ring_mgr *mgr,
                                       struct buf_ring_group *g) {
     struct io_uring_buf_ring *br = BUF_RING_PTR(mgr, g);
     smp_store_release(&br->tail, g->tail);
 }
 
-/* Get buffer address by index */
+// Get buffer address by index
 static inline void *buf_ring_mgr_addr(struct buf_ring_mgr *mgr,
-                                       struct buf_ring_group *g, uint16_t bid) {
+                                       struct buf_ring_group *g, u16 bid) {
     return BUF_RING_ADDR(mgr, g, bid);
 }
 
-/* ============================================================================
- * Zerocopy buffer operations (guarded by ENABLE_ZC)
- * ============================================================================ */
-
+// Zerocopy buffer operations
 #ifdef ENABLE_ZC
 
-/* Bitmap operations */
-static inline void zc_bitmap_set(uint64_t *bitmap, uint16_t idx) {
-    bitmap[idx >> 6] |= (1ULL << (idx & 63));
-}
+// Bitmap operations
+#define zc_bitmap_set(bitmap, idx) (bitmap)[(idx) >> 6] |= (1ULL << ((idx) & 63))
+#define zc_bitmap_clear(bitmap, idx) (bitmap)[(idx) >> 6] &= ~(1ULL << ((idx) & 63))
+#define zc_bitmap_test(bitmap, idx) (((bitmap)[(idx) >> 6] >> ((idx) & 63)) & 1)
 
-static inline void zc_bitmap_clear(uint64_t *bitmap, uint16_t idx) {
-    bitmap[idx >> 6] &= ~(1ULL << (idx & 63));
-}
-
-static inline int zc_bitmap_test(const uint64_t *bitmap, uint16_t idx) {
-    return (bitmap[idx >> 6] >> (idx & 63)) & 1;
-}
-
-static inline int zc_bitmap_ffs(const uint64_t *bitmap, uint16_t count) {
-    uint16_t words = (count + 63) / 64;
-    for (uint16_t i = 0; i < words; i++) {
+static inline int zc_bitmap_ffs(const uint64_t *bitmap, u16 count) {
+    u16 words = (count + 63) / 64;
+    for (u16 i = 0; i < words; i++) {
         if (bitmap[i]) {
-            int bit = __builtin_ctzll(bitmap[i]);
-            uint16_t idx = (i << 6) + bit;
+            u16 idx = (i << 6) + __builtin_ctzll(bitmap[i]);
             return (idx < count) ? idx : -1;
         }
     }
     return -1;
 }
 
-/* Allocate a buffer from ZC group (bitmap-based) */
-static inline uint16_t buf_ring_zc_alloc(struct buf_ring_group *g) {
+// Allocate a buffer from ZC group (bitmap-based)
+static inline u16 buf_ring_zc_alloc(struct buf_ring_group *g) {
     if (unlikely(g->free_count == 0))
         return UINT16_MAX;
 
@@ -704,13 +649,13 @@ static inline uint16_t buf_ring_zc_alloc(struct buf_ring_group *g) {
     if (unlikely(idx < 0))
         return UINT16_MAX;
 
-    zc_bitmap_clear(g->free_bitmap, (uint16_t)idx);
+    zc_bitmap_clear(g->free_bitmap, (u16)idx);
     g->free_count--;
-    return (uint16_t)idx;
+    return (u16)idx;
 }
 
-/* Recycle a ZC buffer (called on notification CQE) */
-static inline void buf_ring_zc_recycle(struct buf_ring_group *g, uint16_t bid) {
+// Recycle a ZC buffer (called on notification CQE)
+static inline void buf_ring_zc_recycle(struct buf_ring_group *g, u16 bid) {
     DEBUG_ONLY(if (bid > g->mask) { LOG_BUG("zc: invalid bid %u", bid); return; });
     DEBUG_ONLY(if (zc_bitmap_test(g->free_bitmap, bid)) {
         LOG_BUG("zc: double free bid %u", bid); return;
@@ -720,20 +665,20 @@ static inline void buf_ring_zc_recycle(struct buf_ring_group *g, uint16_t bid) {
     g->free_count++;
 }
 
-/* Push buffer to kernel ring for bundle consumption */
+// Push buffer to kernel ring for bundle consumption
 static inline void buf_ring_zc_push(struct buf_ring_mgr *mgr,
                                      struct buf_ring_group *g,
-                                     uint16_t bid, uint32_t len) {
+                                     u16 bid, u32 len) {
     struct io_uring_buf_ring *br = BUF_RING_PTR(mgr, g);
     struct io_uring_buf *buf = &br->bufs[g->tail & g->mask];
     buf->addr = (uint64_t)BUF_RING_ADDR(mgr, g, bid);
     buf->len = len;
     buf->bid = bid;
     g->tail++;
-    /* Caller must call buf_ring_mgr_sync() after batch */
+    // Caller must call buf_ring_mgr_sync() after batch
 }
 
-/* Probe kernel for SEND_ZC support */
+// Probe kernel for SEND_ZC support
 static inline int buf_ring_zc_probe(struct uring *ring) {
     size_t probe_size = sizeof(struct io_uring_probe) + 256 * sizeof(struct io_uring_probe_op);
 
@@ -758,6 +703,4 @@ static inline int buf_ring_zc_probe(struct uring *ring) {
     return supported ? 0 : -EOPNOTSUPP;
 }
 
-#endif /* ENABLE_ZC */
-
-#endif /* URING_H */
+#endif // ENABLE_ZC

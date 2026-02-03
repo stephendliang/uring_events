@@ -1,17 +1,11 @@
 /*
- * Raw io_uring HTTP server - No liburing, maximum performance
- *
- * Following CLAUDE.md architecture:
- * - Shared-nothing per-core isolation
- * - No liburing (direct syscalls + ring manipulation)
- * - IORING_SETUP_SUBMIT_ALL, SINGLE_ISSUER, DEFER_TASKRUN, COOP_TASKRUN
- * - Multishot accept + multishot recv with provided buffers
- * - Zero mallocs in hot path
- * - Zero context switches in steady state
- *
- * Build:
- *   Production: gcc -DNDEBUG -O3 ...
- *   Debug:      gcc -DDEBUG -O0 -g ...
+  Raw io_uring HTTP server - No liburing, maximum performance
+  - Shared-nothing per-core isolation
+  - No liburing (direct syscalls + ring manipulation)
+  - IORING_SETUP_SUBMIT_ALL, SINGLE_ISSUER, DEFER_TASKRUN, COOP_TASKRUN
+  - Multishot accept + multishot recv with provided buffers
+  - Zero allocation in hot path
+  - Zero context switches in steady state
  */
 
 #define _GNU_SOURCE
@@ -28,9 +22,14 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 
-/* ============================================================================
- * SIMD infrastructure for SQE template copy
- * ============================================================================ */
+typedef uint8_t  u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef uint64_t u64;
+typedef int32_t  i32;
+typedef int64_t  i64;
+
+// SIMD infrastructure for SQE template copy
 
 #if defined(__AVX512F__)
 #include <immintrin.h>
@@ -40,9 +39,7 @@
 #define USE_AVX2 1
 #endif
 
-/* ============================================================================
- * Debug/Logging macros - compiled out in production (NDEBUG)
- * ============================================================================ */
+// Debug/Logging macros - compiled out in production (NDEBUG)
 
 #ifdef DEBUG
   #define LOG_INFO(fmt, ...)  fprintf(stderr, "[INFO] " fmt "\n", ##__VA_ARGS__)
@@ -58,27 +55,25 @@
   #define DEBUG_ONLY(x)       ((void)0)
 #endif
 
-/* Fatal errors that should crash even in production */
+// Fatal errors that should crash even in production
 #define LOG_FATAL(fmt, ...) do { \
     fprintf(stderr, "[FATAL] " fmt "\n", ##__VA_ARGS__); \
 } while(0)
 
-/* Branch prediction hints */
+// Branch prediction hints
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 
-/* Prefetch for read */
+// Prefetch for read
 #define prefetch_r(addr) __builtin_prefetch((addr), 0, 3)
 
-/* ============================================================================
- * Configuration - All tunable at compile time
- * ============================================================================ */
+// Configuration - All tunable at compile time
 
 #define SQ_ENTRIES          2048
-#define CQ_ENTRIES          (SQ_ENTRIES * 4)    /* 4x SQ per CLAUDE.md */
+#define CQ_ENTRIES          (SQ_ENTRIES * 4)    // 4x SQ per CLAUDE.md
 #define NUM_BUFFERS         4096
 #define BUFFER_SIZE         2048
-#define BUFFER_SHIFT        11                   /* log2(BUFFER_SIZE) */
+#define BUFFER_SHIFT        11                   // log2(BUFFER_SIZE)
 #define BUFFER_GROUP_ID     0
 #define LISTEN_BACKLOG      4096
 #define MAX_CONNECTIONS     65536
@@ -92,7 +87,7 @@ _Static_assert(SQ_ENTRIES >= 256, "SQ_ENTRIES too small");
 
 #include "uring.h"
 
-/* HTTP response - precomputed at compile time */
+// HTTP response - precomputed at compile time
 static const char HTTP_200_RESPONSE[] =
     "HTTP/1.1 200 OK\r\n"
     "Content-Type: text/plain\r\n"
@@ -103,11 +98,8 @@ static const char HTTP_200_RESPONSE[] =
 
 #define HTTP_200_LEN (sizeof(HTTP_200_RESPONSE) - 1)
 
-/* ============================================================================
- * Context encoding - pack into 64-bit user_data
- * Layout: [fd:32][op:8][buf_idx:16][unused:8]
- * ============================================================================ */
-
+/* Context encoding - pack into 64-bit user_data
+   Layout: [fd:32][op:8][buf_idx:16][unused:8] */
 enum op_type {
     OP_ACCEPT     = 0,
     OP_RECV       = 1,
@@ -119,50 +111,49 @@ enum op_type {
 #endif
 };
 
-/* Pre-shifted operation codes for faster encoding */
-#define OP_ACCEPT_SHIFTED     ((uint64_t)OP_ACCEPT << 32)
-#define OP_RECV_SHIFTED       ((uint64_t)OP_RECV << 32)
-#define OP_SEND_SHIFTED       ((uint64_t)OP_SEND << 32)
-#define OP_CLOSE_SHIFTED      ((uint64_t)OP_CLOSE << 32)
-#define OP_SETSOCKOPT_SHIFTED ((uint64_t)OP_SETSOCKOPT << 32)
+// Pre-shifted operation codes for faster encoding
+#define OP_ACCEPT_SHIFTED     ((u64)OP_ACCEPT << 32)
+#define OP_RECV_SHIFTED       ((u64)OP_RECV << 32)
+#define OP_SEND_SHIFTED       ((u64)OP_SEND << 32)
+#define OP_CLOSE_SHIFTED      ((u64)OP_CLOSE << 32)
+#define OP_SETSOCKOPT_SHIFTED ((u64)OP_SETSOCKOPT << 32)
 #ifdef ENABLE_ZC
-#define OP_SEND_ZC_SHIFTED    ((uint64_t)OP_SEND_ZC << 32)
+#define OP_SEND_ZC_SHIFTED    ((u64)OP_SEND_ZC << 32)
 #endif
 
-/* ============================================================================
- * SQE templates - 64-byte aligned for SIMD copy
- * Only fd and user_data vary per operation; everything else is constant.
- * ============================================================================ */
+// SQE templates - 64-byte aligned for SIMD copy
+// fd and user_data will be patched per operation; everything else is constant.
+#define CACHE_ALIGN __attribute__((aligned(64)))
 
-__attribute__((aligned(64)))
+CACHE_ALIGN
 static const struct io_uring_sqe SQE_TEMPLATE_ACCEPT = {
     .opcode = IORING_OP_ACCEPT,
-    .flags = IOSQE_FIXED_FILE,              /* Use fixed file for listen_fd */
+    .flags = IOSQE_FIXED_FILE,              // Use fixed file for listen_fd
     .ioprio = IORING_ACCEPT_MULTISHOT,
-    .fd = 0,  /* Fixed file index of listen socket */
+    .fd = 0,  // Fixed file index of listen socket
     .off = 0,
     .addr = 0,
     .len = 0,
     .accept_flags = 0,
-    .user_data = OP_ACCEPT_SHIFTED | 0xFFFFFFFF,  /* constant: idx = -1 */
+    .user_data = OP_ACCEPT_SHIFTED | 0xFFFFFFFF,  // constant idx = -1
     .buf_group = 0,
     .personality = 0,
-    .file_index = IORING_FILE_INDEX_ALLOC,  /* Kernel allocates fixed file slot */
+    .file_index = IORING_FILE_INDEX_ALLOC,  // Kernel allocates fixed file slot
     .addr3 = 0,
     .__pad2 = {0},
 };
 
-__attribute__((aligned(64)))
+CACHE_ALIGN
 static const struct io_uring_sqe SQE_TEMPLATE_RECV = {
     .opcode = IORING_OP_RECV,
-    .flags = IOSQE_BUFFER_SELECT | IOSQE_FIXED_FILE,  /* Fixed file for client socket */
+    .flags = IOSQE_BUFFER_SELECT | IOSQE_FIXED_FILE,  // Fixed file for client socket
     .ioprio = IORING_RECV_MULTISHOT,
-    .fd = 0,  /* Fixed file index, not fd */
+    .fd = 0,  // Fixed file index not fd
     .off = 0,
     .addr = 0,
-    .len = 0,  /* MUST be 0 for multishot */
+    .len = 0,  // MUST be 0 for multishot
     .msg_flags = 0,
-    .user_data = 0,  /* patched */
+    .user_data = 0,
     .buf_group = BUFFER_GROUP_ID,
     .personality = 0,
     .splice_fd_in = 0,
@@ -170,17 +161,17 @@ static const struct io_uring_sqe SQE_TEMPLATE_RECV = {
     .__pad2 = {0},
 };
 
-__attribute__((aligned(64)))
-static struct io_uring_sqe SQE_TEMPLATE_SEND = {  /* non-const: addr set at init */
+CACHE_ALIGN
+static struct io_uring_sqe SQE_TEMPLATE_SEND = {  // non-const: addr set at init
     .opcode = IORING_OP_SEND,
-    .flags = IOSQE_FIXED_FILE,  /* Fixed file for client socket */
+    .flags = IOSQE_FIXED_FILE,  // Fixed file for client socket
     .ioprio = 0,
-    .fd = 0,  /* Fixed file index, not fd */
+    .fd = 0,  // Fixed file index, not fd
     .off = 0,
-    .addr = 0,  /* set to HTTP_200_RESPONSE at init */
+    .addr = 0,  // set to HTTP_200_RESPONSE at init
     .len = HTTP_200_LEN,
     .msg_flags = 0,
-    .user_data = 0,  /* patched */
+    .user_data = 0,
     .buf_group = 0,
     .personality = 0,
     .splice_fd_in = 0,
@@ -188,17 +179,17 @@ static struct io_uring_sqe SQE_TEMPLATE_SEND = {  /* non-const: addr set at init
     .__pad2 = {0},
 };
 
-__attribute__((aligned(64)))
+CACHE_ALIGN
 static const struct io_uring_sqe SQE_TEMPLATE_CLOSE = {
     .opcode = IORING_OP_CLOSE,
-    .flags = IOSQE_FIXED_FILE,  /* Fixed file for client socket */
+    .flags = IOSQE_FIXED_FILE,  // Fixed file for client socket
     .ioprio = 0,
-    .fd = 0,  /* Fixed file index, not fd */
+    .fd = 0,  // Fixed file index, not fd
     .off = 0,
     .addr = 0,
     .len = 0,
     .rw_flags = 0,
-    .user_data = 0,  /* patched */
+    .user_data = 0,
     .buf_group = 0,
     .personality = 0,
     .splice_fd_in = 0,
@@ -207,7 +198,7 @@ static const struct io_uring_sqe SQE_TEMPLATE_CLOSE = {
 };
 
 #ifdef ENABLE_ZC
-/* ZC buffer group ID - distinct from recv buffer group */
+// ZC buffer group ID - distinct from recv buffer group
 #ifndef ZC_BUFFER_GROUP_ID
 #define ZC_BUFFER_GROUP_ID      1
 #endif
@@ -226,7 +217,7 @@ _Static_assert((ZC_NUM_BUFFERS & (ZC_NUM_BUFFERS - 1)) == 0,
 _Static_assert((1 << ZC_BUFFER_SHIFT) == ZC_BUFFER_SIZE,
                "ZC_BUFFER_SHIFT must match ZC_BUFFER_SIZE");
 
-__attribute__((aligned(64)))
+CACHE_ALIGN
 static const struct io_uring_sqe SQE_TEMPLATE_SEND_ZC = {
     .opcode = IORING_OP_SEND_ZC,
     .flags = IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT,
@@ -243,123 +234,91 @@ static const struct io_uring_sqe SQE_TEMPLATE_SEND_ZC = {
     .addr3 = 0,
     .__pad2 = {0},
 };
-#endif /* ENABLE_ZC */
+#endif // ENABLE_ZC
 
-/* ============================================================================
- * Connection state - bit-packed for cache efficiency
- * ============================================================================ */
-
+// Connection state - bit-packed for cache efficiency
 struct conn_state {
-    uint8_t closing : 1;
-    uint8_t recv_active : 1;
-    uint8_t reserved : 6;
+    u8 closing : 1;
+    u8 recv_active : 1;
+    u8 reserved : 6;
 };
 
 static struct conn_state g_conns[MAX_CONNECTIONS];
 
-/* Static value for async setsockopt - must persist across async operation */
+// Static value for async setsockopt - must persist across async operation
 static int g_tcp_nodelay_val = 1;
 
 static inline struct conn_state *get_conn(int fd) {
-    /* Branchless bounds check - returns NULL for invalid fd */
+    // Branchless bounds check - returns NULL for invalid fd
     unsigned ufd = (unsigned)fd;
     return (ufd < MAX_CONNECTIONS) ? &g_conns[ufd] : NULL;
 }
 
-/* Context encoding helpers (unused - inlined at call sites)
-static inline uint64_t encode_accept(void) {
-    return OP_ACCEPT_SHIFTED | 0xFFFFFFFF;
-}
+#define decode_fd(ud) ((i32)((ud) & 0xFFFFFFFF))
+#define decode_op(ud) ((u8)((ud) >> 32))
+#define decode_buf_idx(ud) ((u16)((ud) >> 40))
 
-static inline uint64_t encode_recv(int fd) {
-    return OP_RECV_SHIFTED | (uint32_t)fd;
-}
-
-static inline uint64_t encode_send(int fd, uint16_t buf_idx) {
-    return OP_SEND_SHIFTED | (uint32_t)fd | ((uint64_t)buf_idx << 40);
-}
-
-static inline uint64_t encode_close(int fd) {
-    return OP_CLOSE_SHIFTED | (uint32_t)fd;
-}
-*/
-
-static inline int32_t decode_fd(uint64_t ud) {
-    return (int32_t)(ud & 0xFFFFFFFF);
-}
-
-static inline uint8_t decode_op(uint64_t ud) {
-    return (uint8_t)(ud >> 32);
-}
-
-static inline uint16_t decode_buf_idx(uint64_t ud) {
-    return (uint16_t)(ud >> 40);
-}
-
-/* ============================================================================
- * SQE preparation - Template copy + patch using SIMD
- *
- * AVX-512: Load template into ZMM, patch fd/user_data in-register, single store.
- *          Zero store-forwarding stalls.
- * AVX2:    Two 256-bit loads/stores, then narrow patches.
- * Scalar:  Struct copy, then narrow patches.
- * ============================================================================ */
+/* SQE preparation - Template copy + patch using SIMD
+   AVX-512: Load template into ZMM, patch fd/user_data in-register, single store.
+            Zero store-forwarding stalls.
+   AVX2:    Two 256-bit loads/stores, then narrow patches.
+   Scalar:  Struct copy, then narrow patches. */
 
 #ifdef USE_AVX512
 
 static inline void prep_multishot_accept_direct(struct io_uring_sqe *sqe, int fd) {
     __m512i zmm = _mm512_load_si512((const __m512i *)&SQE_TEMPLATE_ACCEPT);
-    /* Patch fd at dword index 1 (byte offset 4) */
+    // Patch fd at dword index 1 (byte offset 4)
     zmm = _mm512_mask_set1_epi32(zmm, 1U << 1, fd);
-    /* user_data is constant in template */
+    // user_data is constant in template
     _mm512_store_si512((__m512i *)sqe, zmm);
 }
 
 static inline void prep_recv_multishot_direct(struct io_uring_sqe *sqe, int fd) {
     __m512i zmm = _mm512_load_si512((const __m512i *)&SQE_TEMPLATE_RECV);
-    /* Patch fd at dword index 1 (byte offset 4) */
+    // Patch fd at dword index 1 (byte offset 4)
     zmm = _mm512_mask_set1_epi32(zmm, 1U << 1, fd);
-    /* Patch user_data at qword index 4 (byte offset 32) */
-    uint64_t ud = OP_RECV_SHIFTED | (uint32_t)fd;
+    // Patch user_data at qword index 4 (byte offset 32)
+    u64 ud = OP_RECV_SHIFTED | (u32)fd;
     zmm = _mm512_mask_set1_epi64(zmm, 1U << 4, (long long)ud);
     _mm512_store_si512((__m512i *)sqe, zmm);
 }
 
 static inline void prep_send_direct(struct io_uring_sqe *sqe, int fd,
-                                     const void *buf, uint32_t len,
-                                     uint16_t buf_idx) {
-    (void)buf; (void)len;  /* Template has pre-set addr and len */
+                                     const void *buf, u32 len,
+                                     u16 buf_idx) {
+    (void)buf; (void)len;  // Template has pre-set addr and len
     __m512i zmm = _mm512_load_si512((const __m512i *)&SQE_TEMPLATE_SEND);
-    /* Patch fd at dword index 1 (byte offset 4) */
+    // Patch fd at dword index 1 (byte offset 4)
     zmm = _mm512_mask_set1_epi32(zmm, 1U << 1, fd);
-    /* Patch user_data at qword index 4 (byte offset 32) */
-    uint64_t ud = OP_SEND_SHIFTED | (uint32_t)fd | ((uint64_t)buf_idx << 40);
+    // Patch user_data at qword index 4 (byte offset 32)
+    u64 ud = OP_SEND_SHIFTED | (u32)fd | ((u64)buf_idx << 40);
     zmm = _mm512_mask_set1_epi64(zmm, 1U << 4, (long long)ud);
     _mm512_store_si512((__m512i *)sqe, zmm);
 }
 
 static inline void prep_close_direct(struct io_uring_sqe *sqe, int fd) {
     __m512i zmm = _mm512_load_si512((const __m512i *)&SQE_TEMPLATE_CLOSE);
-    /* Patch fd at dword index 1 (byte offset 4) */
+    // Patch fd at dword index 1 (byte offset 4)
     zmm = _mm512_mask_set1_epi32(zmm, 1U << 1, fd);
-    /* Patch user_data at qword index 4 (byte offset 32) */
-    uint64_t ud = OP_CLOSE_SHIFTED | (uint32_t)fd;
+    // Patch user_data at qword index 4 (byte offset 32)
+    u64 ud = OP_CLOSE_SHIFTED | (u32)fd;
     zmm = _mm512_mask_set1_epi64(zmm, 1U << 4, (long long)ud);
     _mm512_store_si512((__m512i *)sqe, zmm);
 }
 
 #ifdef ENABLE_ZC
 static inline void prep_send_zc_direct(struct io_uring_sqe *sqe, int fd,
-                                        uint16_t buf_idx) {
+                                        u16 buf_idx) {
     __m512i zmm = _mm512_load_si512((const __m512i *)&SQE_TEMPLATE_SEND_ZC);
     zmm = _mm512_mask_set1_epi32(zmm, 1U << 1, fd);
-    uint64_t ud = OP_SEND_ZC_SHIFTED | (uint32_t)fd | ((uint64_t)buf_idx << 40);
+    u64 ud = OP_SEND_ZC_SHIFTED | (u32)fd | ((u64)buf_idx << 40);
     zmm = _mm512_mask_set1_epi64(zmm, 1U << 4, (long long)ud);
     _mm512_store_si512((__m512i *)sqe, zmm);
 }
 #endif
 
-#else  /* AVX2 or scalar fallback */
+#else  // AVX2 or scalar fallback
 
 #ifdef USE_AVX2
 
@@ -375,20 +334,20 @@ static inline void prep_recv_multishot_direct(struct io_uring_sqe *sqe, int fd) 
     __m256i lo = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_RECV);
     __m256i hi = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_RECV + 1);
     lo = _mm256_blend_epi32(lo, _mm256_set1_epi32(fd), 1 << 1);
-    uint64_t ud = OP_RECV_SHIFTED | (uint32_t)fd;
+    u64 ud = OP_RECV_SHIFTED | (u32)fd;
     hi = _mm256_blend_epi32(hi, _mm256_set1_epi64x((long long)ud), 0x03);
     _mm256_store_si256((__m256i *)sqe, lo);
     _mm256_store_si256((__m256i *)sqe + 1, hi);
 }
 
 static inline void prep_send_direct(struct io_uring_sqe *sqe, int fd,
-                                     const void *buf, uint32_t len,
-                                     uint16_t buf_idx) {
+                                     const void *buf, u32 len,
+                                     u16 buf_idx) {
     (void)buf; (void)len;
     __m256i lo = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_SEND);
     __m256i hi = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_SEND + 1);
     lo = _mm256_blend_epi32(lo, _mm256_set1_epi32(fd), 1 << 1);
-    uint64_t ud = OP_SEND_SHIFTED | (uint32_t)fd | ((uint64_t)buf_idx << 40);
+    u64 ud = OP_SEND_SHIFTED | (u32)fd | ((u64)buf_idx << 40);
     hi = _mm256_blend_epi32(hi, _mm256_set1_epi64x((long long)ud), 0x03);
     _mm256_store_si256((__m256i *)sqe, lo);
     _mm256_store_si256((__m256i *)sqe + 1, hi);
@@ -398,7 +357,7 @@ static inline void prep_close_direct(struct io_uring_sqe *sqe, int fd) {
     __m256i lo = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_CLOSE);
     __m256i hi = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_CLOSE + 1);
     lo = _mm256_blend_epi32(lo, _mm256_set1_epi32(fd), 1 << 1);
-    uint64_t ud = OP_CLOSE_SHIFTED | (uint32_t)fd;
+    u64 ud = OP_CLOSE_SHIFTED | (u32)fd;
     hi = _mm256_blend_epi32(hi, _mm256_set1_epi64x((long long)ud), 0x03);
     _mm256_store_si256((__m256i *)sqe, lo);
     _mm256_store_si256((__m256i *)sqe + 1, hi);
@@ -406,18 +365,18 @@ static inline void prep_close_direct(struct io_uring_sqe *sqe, int fd) {
 
 #ifdef ENABLE_ZC
 static inline void prep_send_zc_direct(struct io_uring_sqe *sqe, int fd,
-                                        uint16_t buf_idx) {
+                                        u16 buf_idx) {
     __m256i lo = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_SEND_ZC);
     __m256i hi = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_SEND_ZC + 1);
     lo = _mm256_blend_epi32(lo, _mm256_set1_epi32(fd), 1 << 1);
-    uint64_t ud = OP_SEND_ZC_SHIFTED | (uint32_t)fd | ((uint64_t)buf_idx << 40);
+    u64 ud = OP_SEND_ZC_SHIFTED | (u32)fd | ((u64)buf_idx << 40);
     hi = _mm256_blend_epi32(hi, _mm256_set1_epi64x((long long)ud), 0x03);
     _mm256_store_si256((__m256i *)sqe, lo);
     _mm256_store_si256((__m256i *)sqe + 1, hi);
 }
 #endif
 
-#else  /* Scalar fallback */
+#else  // Scalar fallback
 
 static inline void sqe_copy_64(struct io_uring_sqe *dst,
                                 const struct io_uring_sqe *src) {
@@ -432,30 +391,30 @@ static inline void prep_multishot_accept_direct(struct io_uring_sqe *sqe, int fd
 static inline void prep_recv_multishot_direct(struct io_uring_sqe *sqe, int fd) {
     sqe_copy_64(sqe, &SQE_TEMPLATE_RECV);
     sqe->fd = fd;
-    sqe->user_data = OP_RECV_SHIFTED | (uint32_t)fd;
+    sqe->user_data = OP_RECV_SHIFTED | (u32)fd;
 }
 
 static inline void prep_send_direct(struct io_uring_sqe *sqe, int fd,
-                                     const void *buf, uint32_t len,
-                                     uint16_t buf_idx) {
+                                     const void *buf, u32 len,
+                                     u16 buf_idx) {
     (void)buf; (void)len;
     sqe_copy_64(sqe, &SQE_TEMPLATE_SEND);
     sqe->fd = fd;
-    sqe->user_data = OP_SEND_SHIFTED | (uint32_t)fd | ((uint64_t)buf_idx << 40);
+    sqe->user_data = OP_SEND_SHIFTED | (u32)fd | ((u64)buf_idx << 40);
 }
 
 static inline void prep_close_direct(struct io_uring_sqe *sqe, int fd) {
     sqe_copy_64(sqe, &SQE_TEMPLATE_CLOSE);
     sqe->fd = fd;
-    sqe->user_data = OP_CLOSE_SHIFTED | (uint32_t)fd;
+    sqe->user_data = OP_CLOSE_SHIFTED | (u32)fd;
 }
 
 #ifdef ENABLE_ZC
 static inline void prep_send_zc_direct(struct io_uring_sqe *sqe, int fd,
-                                        uint16_t buf_idx) {
+                                        u16 buf_idx) {
     sqe_copy_64(sqe, &SQE_TEMPLATE_SEND_ZC);
     sqe->fd = fd;
-    sqe->user_data = OP_SEND_ZC_SHIFTED | (uint32_t)fd | ((uint64_t)buf_idx << 40);
+    sqe->user_data = OP_SEND_ZC_SHIFTED | (u32)fd | ((u64)buf_idx << 40);
 }
 #endif
 
@@ -468,33 +427,31 @@ static inline void prep_setsockopt_direct(struct io_uring_sqe *sqe, int idx,
                                            int level, int optname,
                                            void *optval, int optlen) {
     sqe->opcode = IORING_OP_URING_CMD;
-    sqe->flags = IOSQE_CQE_SKIP_SUCCESS | IOSQE_FIXED_FILE;  /* Fixed file for client socket */
+    sqe->flags = IOSQE_CQE_SKIP_SUCCESS | IOSQE_FIXED_FILE;  // Fixed file for client socket
     sqe->ioprio = 0;
-    sqe->fd = idx;  /* Fixed file index */
-    sqe->off = 0;  /* cmd_op = SOCKET_URING_OP_SETSOCKOPT (0) */
+    sqe->fd = idx;  // Fixed file index
+    sqe->off = 0;  // cmd_op = SOCKET_URING_OP_SETSOCKOPT (0)
     sqe->addr = 0;
     sqe->len = 0;
     sqe->rw_flags = 0;
-    sqe->user_data = OP_SETSOCKOPT_SHIFTED | (uint32_t)idx;
+    sqe->user_data = OP_SETSOCKOPT_SHIFTED | (u32)idx;
     sqe->buf_group = 0;
     sqe->personality = 0;
     sqe->splice_fd_in = 0;
     sqe->addr3 = 0;
     sqe->__pad2[0] = 0;
 
-    /* Socket command parameters in cmd array (offset 48 in SQE)
-     * Layout: level(4) | optname(4) | optlen(4) | pad(4) | optval(8) */
-    uint8_t *cmd = (uint8_t *)sqe + 48;
-    *(uint32_t *)(cmd + 0) = (uint32_t)level;
-    *(uint32_t *)(cmd + 4) = (uint32_t)optname;
-    *(uint32_t *)(cmd + 8) = (uint32_t)optlen;
-    *(uint32_t *)(cmd + 12) = 0;  /* padding */
-    *(uint64_t *)(cmd + 16) = (uint64_t)(uintptr_t)optval;
+    // Socket command parameters in cmd array (offset 48 in SQE)
+    // Layout: level(4) | optname(4) | optlen(4) | pad(4) | optval(8)
+    u8 *cmd = (u8 *)sqe + 48;
+    *(u32 *)(cmd + 0) = (u32)level;
+    *(u32 *)(cmd + 4) = (u32)optname;
+    *(u32 *)(cmd + 8) = (u32)optlen;
+    *(u32 *)(cmd + 12) = 0;  // padding
+    *(u64 *)(cmd + 16) = (u64)(uintptr_t)optval;
 }
 
-/* ============================================================================
- * Listening socket setup (startup path - not performance critical)
- * ============================================================================ */
+// Listening socket setup (startup path - not performance critical)
 
 static int create_listen_socket(int port, int cpu) {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -510,7 +467,7 @@ static int create_listen_socket(int port, int cpu) {
 
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
-        .sin_port = htons((uint16_t)port),
+        .sin_port = htons((u16)port),
         .sin_addr.s_addr = htonl(INADDR_ANY),
     };
 
@@ -529,10 +486,7 @@ static int create_listen_socket(int port, int cpu) {
     return fd;
 }
 
-/* ============================================================================
- * CPU affinity (startup path)
- * ============================================================================ */
-
+// CPU affinity (startup path)
 static int set_cpu_affinity(int cpu) {
     if (cpu < 0 || cpu >= CPU_SETSIZE)
         return -1;
@@ -544,22 +498,19 @@ static int set_cpu_affinity(int cpu) {
     return sched_setaffinity(0, sizeof(cpuset), &cpuset);
 }
 
-/* ============================================================================
- * Server context
- * ============================================================================ */
-
+// Server context
 struct server_ctx {
     struct uring ring;
     struct buf_ring_mgr br_mgr;
-    struct buf_ring_group *recv_grp;    /* Pointer into br_mgr.groups[0] */
+    struct buf_ring_group *recv_grp;    // Pointer into br_mgr.groups[0]
 #ifdef ENABLE_ZC
-    struct buf_ring_group *zc_grp;      /* Pointer into br_mgr.groups[1] */
+    struct buf_ring_group *zc_grp;      // Pointer into br_mgr.groups[1]
     bool zc_enabled;
 #endif
-    /* Legacy buf_ring for hot path caching (populated from recv_grp) */
+    // Legacy buf_ring for hot path caching (populated from recv_grp)
     struct buf_ring br;
     int listen_fd;
-    sig_atomic_t running;  /* Proper type for signal handlers */
+    sig_atomic_t running;  // Proper type for signal handlers
 };
 
 static struct server_ctx *g_ctx = NULL;
@@ -570,10 +521,7 @@ static void signal_handler(int sig) {
         g_ctx->running = 0;
 }
 
-/* ============================================================================
- * Event handlers - HOT PATH, maximally optimized
- * ============================================================================ */
-
+// Event handlers - HOT PATH, maximally optimized
 static inline bool queue_accept(struct server_ctx *ctx) {
     struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
     if (unlikely(!sqe)) {
@@ -599,7 +547,7 @@ static inline bool queue_recv(struct server_ctx *ctx, int fd) {
     return true;
 }
 
-static inline bool queue_send(struct server_ctx *ctx, int fd, uint16_t buf_idx) {
+static inline bool queue_send(struct server_ctx *ctx, int fd, u16 buf_idx) {
     struct conn_state *c = get_conn(fd);
     if (unlikely(!c) || c->closing) {
         buf_ring_recycle(&ctx->br, buf_idx);
@@ -622,7 +570,7 @@ static inline bool queue_close(struct server_ctx *ctx, int fd) {
         return false;
 
     if (c->closing)
-        return true;  /* Already queued */
+        return true;  // Already queued
 
     struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
     if (unlikely(!sqe)) {
@@ -648,19 +596,19 @@ static inline bool queue_setsockopt_nodelay(struct server_ctx *ctx, int fd) {
 
 #ifdef ENABLE_ZC
 static inline bool queue_send_zc(struct server_ctx *ctx, int fd,
-                                  const void *data, uint32_t len) {
+                                  const void *data, u32 len) {
     struct conn_state *c = get_conn(fd);
     if (unlikely(!c) || c->closing)
         return false;
 
-    uint16_t buf_idx = buf_ring_zc_alloc(ctx->zc_grp);
+    u16 buf_idx = buf_ring_zc_alloc(ctx->zc_grp);
     if (unlikely(buf_idx == UINT16_MAX)) {
         LOG_WARN("zc: no buffers fd=%d", fd);
         return false;
     }
 
     void *buf = buf_ring_mgr_addr(&ctx->br_mgr, ctx->zc_grp, buf_idx);
-    uint32_t copy_len = (len > ZC_BUFFER_SIZE) ? ZC_BUFFER_SIZE : len;
+    u32 copy_len = (len > ZC_BUFFER_SIZE) ? ZC_BUFFER_SIZE : len;
     memcpy(buf, data, copy_len);
 
     buf_ring_zc_push(&ctx->br_mgr, ctx->zc_grp, buf_idx, copy_len);
@@ -678,24 +626,24 @@ static inline bool queue_send_zc(struct server_ctx *ctx, int fd,
 
 static inline void handle_send_zc(struct server_ctx *ctx,
                                    struct io_uring_cqe *cqe, int fd) {
-    uint16_t buf_idx = decode_buf_idx(cqe->user_data);
+    u16 buf_idx = decode_buf_idx(cqe->user_data);
 
     if (cqe->flags & IORING_CQE_F_NOTIF) {
-        /* Notification: buffer safe to reuse */
+        // Notification: buffer safe to reuse
         buf_ring_zc_recycle(ctx->zc_grp, buf_idx);
         return;
     }
 
-    /* Completion: send done, buffer still in-flight to NIC */
+    // Completion: send done, buffer still in-flight to NIC
     int res = cqe->res;
     if (unlikely(res < 0)) {
         if (res != -EPIPE && res != -ECONNRESET && res != -EBADF && res != -ECANCELED)
             LOG_ERROR("zc send error %d fd=%d", res, fd);
         queue_close(ctx, fd);
     }
-    /* Do NOT recycle - wait for NOTIF */
+    // Do NOT recycle - wait for NOTIF
 }
-#endif /* ENABLE_ZC */
+#endif // ENABLE_ZC
 
 static inline void handle_setsockopt(struct server_ctx *ctx,
                                       struct io_uring_cqe *cqe, int fd) {
@@ -703,26 +651,26 @@ static inline void handle_setsockopt(struct server_ctx *ctx,
     if (unlikely(cqe->res < 0)) {
         LOG_WARN("setsockopt failed fd=%d res=%d", fd, cqe->res);
     }
-    /* TCP_NODELAY failure is non-fatal, connection proceeds */
+    // TCP_NODELAY failure is non-fatal, connection proceeds
 }
 
 static inline void handle_accept(struct server_ctx *ctx, struct io_uring_cqe *cqe) {
-    int idx = cqe->res;  /* Fixed file INDEX, not fd */
+    int idx = cqe->res;  // Fixed file INDEX, not fd
 
     if (likely(idx >= 0)) {
-        struct conn_state *c = get_conn(idx);  /* idx used as connection ID */
+        struct conn_state *c = get_conn(idx);  // idx used as connection ID
         if (likely(c)) {
             c->closing = 0;
             c->recv_active = 0;
 
-            /* Async TCP_NODELAY via io_uring - kernel resolves fixed file internally */
+            // Async TCP_NODELAY via io_uring - kernel resolves fixed file internally
             queue_setsockopt_nodelay(ctx, idx);
 
             if (unlikely(!queue_recv(ctx, idx))) {
-                queue_close(ctx, idx);  /* Async close */
+                queue_close(ctx, idx); // Async close
             }
         } else {
-            queue_close(ctx, idx);  /* Async close */
+            queue_close(ctx, idx); // Async close
         }
     } else if (idx != -EAGAIN && idx != -EWOULDBLOCK && idx != -ECANCELED) {
         LOG_ERROR("accept error: %d", idx);
@@ -765,7 +713,7 @@ static inline void handle_recv(struct server_ctx *ctx, struct io_uring_cqe *cqe,
         return;
     }
 
-    uint16_t buf_idx = (uint16_t)(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
+    u16 buf_idx = (u16)(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
 
     DEBUG_ONLY(if (buf_idx >= NUM_BUFFERS) {
         LOG_BUG("invalid buf_idx %u fd=%d", buf_idx, fd);
@@ -791,10 +739,7 @@ static inline void handle_close(int fd) {
     }
 }
 
-/* ============================================================================
- * Main event loop - ULTRA HOT PATH
- * ============================================================================ */
-
+// Main event loop - ULTRA HOT PATH
 static void event_loop(struct server_ctx *ctx) {
     struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 };  // 1ms
 
@@ -803,18 +748,18 @@ static void event_loop(struct server_ctx *ctx) {
         return;
     }
 
-    /* Cache frequently accessed values */
+    // Cache frequently accessed values
     struct uring_cq *cq = &ctx->ring.cq;
-    const uint32_t cq_mask = cq->ring_mask;
+    const u32 cq_mask = cq->ring_mask;
     struct io_uring_cqe *cqes = cq->cqes;
 
-    /* Cache buf_ring invariants - these never change after init */
+    // Cache buf_ring invariants - these never change after init
     struct io_uring_buf_ring *const br_ring = ctx->br.br;
-    uint8_t *const br_base = ctx->br.buf_base;
-    const uint16_t br_mask = ctx->br.mask;
+    u8 *const br_base = ctx->br.buf_base;
+    const u16 br_mask = ctx->br.mask;
 
-    /* Cache CQ head - we're the only writer, no need to re-read from shared memory */
-    uint32_t head = *cq->khead;
+    // Cache CQ head - we're the only writer, no need to re-read from shared memory
+    u32 head = *cq->khead;
 
     while (likely(ctx->running)) {
         int ret = uring_submit_and_wait(&ctx->ring, 1, &ts);
@@ -823,47 +768,47 @@ static void event_loop(struct server_ctx *ctx) {
             break;
         }
 
-        uint32_t tail = smp_load_acquire(cq->ktail);
+        u32 tail = smp_load_acquire(cq->ktail);
 
-        /* Cache buffer ring tail locally for this batch */
-        uint16_t br_tail = ctx->br.tail;
-        const uint16_t br_tail_start = br_tail;
+        // Cache buffer ring tail locally for this batch
+        u16 br_tail = ctx->br.tail;
+        const u16 br_tail_start = br_tail;
 
         while (head != tail) {
             struct io_uring_cqe *cqe = &cqes[head & cq_mask];
 
-            /* Prefetch next CQE */
+            // Prefetch next CQE
             prefetch_r(&cqes[(head + 1) & cq_mask]);
 
-            uint64_t ud = cqe->user_data;
+            u64 ud = cqe->user_data;
             int32_t fd = decode_fd(ud);
-            uint8_t op = decode_op(ud);
+            u8 op = decode_op(ud);
 
-            /* Switch dispatch - enables inlining and uses direct branches */
+            // Switch dispatch for operations
             switch (op) {
             case OP_ACCEPT:
                 handle_accept(ctx, cqe);
                 break;
             case OP_RECV:
-                ctx->br.tail = br_tail;   /* Sync cached → ctx before call */
+                ctx->br.tail = br_tail;   // Sync cached → ctx before call
                 handle_recv(ctx, cqe, fd);
-                br_tail = ctx->br.tail;   /* Sync ctx → cached after call */
+                br_tail = ctx->br.tail;   // Sync ctx → cached after call
                 break;
             case OP_SEND: {
-                uint16_t buf_idx = decode_buf_idx(ud);
-                /* Inline buffer recycling with cached values */
+                u16 buf_idx = decode_buf_idx(ud);
+                // Inline buffer recycling with cached values for performance
                 struct io_uring_buf *buf = &br_ring->bufs[br_tail & br_mask];
-                buf->addr = (uint64_t)(br_base + ((uint32_t)buf_idx << BUFFER_SHIFT));
+                buf->addr = (u64)(br_base + ((u32)buf_idx << BUFFER_SHIFT));
                 buf->len = BUFFER_SIZE;
                 buf->bid = buf_idx;
                 br_tail++;
-                /* Send completion error checking */
+                // Send completion error checking
                 int res = cqe->res;
                 if (unlikely(res < 0)) {
                     if (res != -EPIPE && res != -ECONNRESET && res != -EBADF && res != -ECANCELED)
                         LOG_ERROR("send error %d fd=%d", res, fd);
                     queue_close(ctx, fd);
-                } else if (unlikely((uint32_t)res < HTTP_200_LEN)) {
+                } else if (unlikely((u32)res < HTTP_200_LEN)) {
                     LOG_WARN("partial send fd=%d %d/%zu", fd, res, HTTP_200_LEN);
                     queue_close(ctx, fd);
                 }
@@ -888,9 +833,9 @@ static void event_loop(struct server_ctx *ctx) {
             head++;
         }
 
-        /* Write back cached tail and sync if buffers were recycled */
+        // Write back cached tail and sync if buffers were recycled
         ctx->br.tail = br_tail;
-        ctx->recv_grp->tail = br_tail;  /* Keep recv_grp in sync */
+        ctx->recv_grp->tail = br_tail;  // Keep recv_grp in sync
         if (br_tail != br_tail_start)
             buf_ring_sync(&ctx->br);
         smp_store_release(cq->khead, head);
@@ -899,10 +844,7 @@ static void event_loop(struct server_ctx *ctx) {
     LOG_INFO("Event loop exiting");
 }
 
-/* ============================================================================
- * Input validation (startup only)
- * ============================================================================ */
-
+// Input validation (startup only)
 static int parse_int(const char *str, int min, int max, const char *name) {
     char *end;
     errno = 0;
@@ -914,10 +856,6 @@ static int parse_int(const char *str, int min, int max, const char *name) {
     }
     return (int)val;
 }
-
-/* ============================================================================
- * Main
- * ============================================================================ */
 
 int main(int argc, char *argv[]) {
     int port = 8080;
@@ -946,7 +884,7 @@ int main(int argc, char *argv[]) {
     struct server_ctx ctx = { .running = 1 };
     g_ctx = &ctx;
 
-    /* Clear connection state */
+    // Clear connection state
     memset(g_conns, 0, sizeof(g_conns));
 
     struct sigaction sa;
@@ -956,8 +894,8 @@ int main(int argc, char *argv[]) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    /* Initialize SEND template with runtime address */
-    SQE_TEMPLATE_SEND.addr = (uint64_t)HTTP_200_RESPONSE;
+    // Initialize SEND template with runtime address
+    SQE_TEMPLATE_SEND.addr = (u64)HTTP_200_RESPONSE;
 
     int ret = uring_init(&ctx.ring);
     if (ret < 0) {
@@ -966,7 +904,7 @@ int main(int argc, char *argv[]) {
     }
     LOG_INFO("io_uring features: 0x%x", ctx.ring.features);
 
-    /* Initialize unified buffer ring manager */
+    // Initialize unified buffer ring manager
     struct buf_ring_config configs[] = {
         { .num_buffers = NUM_BUFFERS, .buffer_size = BUFFER_SIZE,
           .buffer_shift = BUFFER_SHIFT, .bgid = BUFFER_GROUP_ID,
@@ -989,7 +927,7 @@ int main(int argc, char *argv[]) {
     ctx.recv_grp = &ctx.br_mgr.groups[0];
 #ifdef ENABLE_ZC
     ctx.zc_grp = &ctx.br_mgr.groups[1];
-    /* Probe for ZC support */
+    // Probe for ZC support
     ret = buf_ring_zc_probe(&ctx.ring);
     ctx.zc_enabled = (ret == 0);
     if (ctx.zc_enabled) {
@@ -999,7 +937,7 @@ int main(int argc, char *argv[]) {
     }
 #endif
 
-    /* Setup legacy buf_ring struct for hot path (points into br_mgr) */
+    // Setup legacy buf_ring struct for hot path (points into br_mgr)
     ctx.br.br = BUF_RING_PTR(&ctx.br_mgr, ctx.recv_grp);
     ctx.br.buf_base = BUF_RING_DATA(&ctx.br_mgr, ctx.recv_grp);
     ctx.br.tail = ctx.recv_grp->tail;
@@ -1010,7 +948,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Register fixed file table for direct accept */
+    // Register fixed file table for direct accept
     ret = uring_register_fixed_files(&ctx.ring, MAX_CONNECTIONS);
     if (ret < 0) {
         LOG_FATAL("fixed file registration: %d", ret);
@@ -1023,7 +961,7 @@ int main(int argc, char *argv[]) {
     int install_fds[1] = { listen_fd };
     struct io_uring_files_update update = {
         .offset = 0,
-        .fds = (uint64_t)(uintptr_t)install_fds,
+        .fds = (u64)(uintptr_t)install_fds,
     };
     ret = io_uring_register(ctx.ring.ring_fd, IORING_REGISTER_FILES_UPDATE, &update, 1);
     if (ret < 0) {
@@ -1032,19 +970,19 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Close the original fd - fixed file table has the reference now */
+    // Close the original fd - fixed file table has the reference now
     close(listen_fd);
-    ctx.listen_fd = 0;  /* Now this is the fixed file index */
+    ctx.listen_fd = 0;  // Now this is the fixed file index
 
     LOG_INFO("Listening on port %d (fixed file index 0)", port);
 
     event_loop(&ctx);
 
-    /* Cleanup buffer ring manager (unregisters from kernel, single munmap) */
+    // Cleanup buffer ring manager (unregisters from kernel, single munmap)
     buf_ring_mgr_destroy(&ctx.ring, &ctx.br_mgr);
 
-    /* listen_fd is now a fixed file index - gets cleaned up with ring.
-     * Only close the ring fd. */
+    // listen_fd is now a fixed file index - gets cleaned up with ring.
+    // Only close the ring fd
     close(ctx.ring.ring_fd);
 
     LOG_INFO("Server stopped");
