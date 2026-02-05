@@ -32,11 +32,11 @@ typedef int64_t  i64;
 // SIMD infrastructure for SQE template copy
 
 #if defined(__AVX512F__)
-#include <immintrin.h>
-#define USE_AVX512 1
+#include "sqe_avx512.h"
 #elif defined(__AVX2__)
-#include <immintrin.h>
-#define USE_AVX2 1
+#include "sqe_avx2.h"
+#else
+#include "sqe_scalar.h"
 #endif
 
 // Debug/Logging macros - compiled out in production (NDEBUG)
@@ -69,14 +69,16 @@ typedef int64_t  i64;
 
 // Configuration - All tunable at compile time
 
-#define SQ_ENTRIES          2048
-#define CQ_ENTRIES          (SQ_ENTRIES * 4)    // 4x SQ per CLAUDE.md
-#define NUM_BUFFERS         4096
-#define BUFFER_SIZE         2048
-#define BUFFER_SHIFT        11                   // log2(BUFFER_SIZE)
-#define BUFFER_GROUP_ID     0
-#define LISTEN_BACKLOG      4096
-#define MAX_CONNECTIONS     65536
+enum {
+    SQ_ENTRIES      = 2048,
+    CQ_ENTRIES      = SQ_ENTRIES * 4,
+    NUM_BUFFERS     = 4096,
+    BUFFER_SIZE     = 2048,
+    BUFFER_SHIFT    = 11,
+    BUFFER_GROUP_ID = 0,
+    LISTEN_BACKLOG  = 4096,
+    MAX_CONNECTIONS = 65536,
+};
 
 /* Compile-time validation */
 _Static_assert((NUM_BUFFERS & (NUM_BUFFERS - 1)) == 0, "NUM_BUFFERS must be power of 2");
@@ -127,74 +129,33 @@ enum op_type {
 
 CACHE_ALIGN
 static const struct io_uring_sqe SQE_TEMPLATE_ACCEPT = {
-    .opcode = IORING_OP_ACCEPT,
-    .flags = IOSQE_FIXED_FILE,              // Use fixed file for listen_fd
-    .ioprio = IORING_ACCEPT_MULTISHOT,
-    .fd = 0,  // Fixed file index of listen socket
-    .off = 0,
-    .addr = 0,
-    .len = 0,
-    .accept_flags = 0,
-    .user_data = OP_ACCEPT_SHIFTED | 0xFFFFFFFF,  // constant idx = -1
-    .buf_group = 0,
-    .personality = 0,
-    .file_index = IORING_FILE_INDEX_ALLOC,  // Kernel allocates fixed file slot
-    .addr3 = 0,
-    .__pad2 = {0},
+    .opcode     = IORING_OP_ACCEPT,
+    .flags      = IOSQE_FIXED_FILE,
+    .ioprio     = IORING_ACCEPT_MULTISHOT,
+    .user_data  = OP_ACCEPT_SHIFTED | 0xFFFFFFFF,
+    .file_index = IORING_FILE_INDEX_ALLOC,
 };
 
 CACHE_ALIGN
 static const struct io_uring_sqe SQE_TEMPLATE_RECV = {
-    .opcode = IORING_OP_RECV,
-    .flags = IOSQE_BUFFER_SELECT | IOSQE_FIXED_FILE,  // Fixed file for client socket
-    .ioprio = IORING_RECV_MULTISHOT,
-    .fd = 0,  // Fixed file index not fd
-    .off = 0,
-    .addr = 0,
-    .len = 0,  // MUST be 0 for multishot
-    .msg_flags = 0,
-    .user_data = 0,
+    .opcode    = IORING_OP_RECV,
+    .flags     = IOSQE_BUFFER_SELECT | IOSQE_FIXED_FILE,
+    .ioprio    = IORING_RECV_MULTISHOT,
+    .len       = 0, /* MUST be 0 for multishot */
     .buf_group = BUFFER_GROUP_ID,
-    .personality = 0,
-    .splice_fd_in = 0,
-    .addr3 = 0,
-    .__pad2 = {0},
 };
 
 CACHE_ALIGN
-static struct io_uring_sqe SQE_TEMPLATE_SEND = {  // non-const: addr set at init
+static struct io_uring_sqe SQE_TEMPLATE_SEND = { /* non-const: addr set at init */
     .opcode = IORING_OP_SEND,
-    .flags = IOSQE_FIXED_FILE,  // Fixed file for client socket
-    .ioprio = 0,
-    .fd = 0,  // Fixed file index, not fd
-    .off = 0,
-    .addr = 0,  // set to HTTP_200_RESPONSE at init
-    .len = HTTP_200_LEN,
-    .msg_flags = 0,
-    .user_data = 0,
-    .buf_group = 0,
-    .personality = 0,
-    .splice_fd_in = 0,
-    .addr3 = 0,
-    .__pad2 = {0},
+    .flags  = IOSQE_FIXED_FILE,
+    .len    = HTTP_200_LEN,
 };
 
 CACHE_ALIGN
 static const struct io_uring_sqe SQE_TEMPLATE_CLOSE = {
     .opcode = IORING_OP_CLOSE,
-    .flags = IOSQE_FIXED_FILE,  // Fixed file for client socket
-    .ioprio = 0,
-    .fd = 0,  // Fixed file index, not fd
-    .off = 0,
-    .addr = 0,
-    .len = 0,
-    .rw_flags = 0,
-    .user_data = 0,
-    .buf_group = 0,
-    .personality = 0,
-    .splice_fd_in = 0,
-    .addr3 = 0,
-    .__pad2 = {0},
+    .flags  = IOSQE_FIXED_FILE,
 };
 
 #ifdef ENABLE_ZC
@@ -219,20 +180,10 @@ _Static_assert((1 << ZC_BUFFER_SHIFT) == ZC_BUFFER_SIZE,
 
 CACHE_ALIGN
 static const struct io_uring_sqe SQE_TEMPLATE_SEND_ZC = {
-    .opcode = IORING_OP_SEND_ZC,
-    .flags = IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT,
-    .ioprio = IORING_RECVSEND_BUNDLE,
-    .fd = 0,
-    .off = 0,
-    .addr = 0,
-    .len = 0,
-    .msg_flags = 0,
-    .user_data = 0,
+    .opcode    = IORING_OP_SEND_ZC,
+    .flags     = IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT,
+    .ioprio    = IORING_RECVSEND_BUNDLE,
     .buf_group = ZC_BUFFER_GROUP_ID,
-    .personality = 0,
-    .splice_fd_in = 0,
-    .addr3 = 0,
-    .__pad2 = {0},
 };
 #endif // ENABLE_ZC
 
@@ -258,169 +209,25 @@ static inline struct conn_state *get_conn(int fd) {
 #define decode_op(ud) ((u8)((ud) >> 32))
 #define decode_buf_idx(ud) ((u16)((ud) >> 40))
 
-/* SQE preparation - Template copy + patch using SIMD
-   AVX-512: Load template into ZMM, patch fd/user_data in-register, single store.
-            Zero store-forwarding stalls.
-   AVX2:    Two 256-bit loads/stores, then narrow patches.
-   Scalar:  Struct copy, then narrow patches. */
+// SQE prep wrappers - macro dispatch to PREP_SQE (defined by sqe_*.h)
+#define prep_multishot_accept_direct(sqe, fd) \
+    PREP_SQE(sqe, SQE_TEMPLATE_ACCEPT, fd, OP_ACCEPT_SHIFTED | 0xFFFFFFFF)
 
-#ifdef USE_AVX512
+#define prep_recv_multishot_direct(sqe, fd) \
+    PREP_SQE(sqe, SQE_TEMPLATE_RECV, fd, OP_RECV_SHIFTED | (u32)(fd))
 
-static inline void prep_multishot_accept_direct(struct io_uring_sqe *sqe, int fd) {
-    __m512i zmm = _mm512_load_si512((const __m512i *)&SQE_TEMPLATE_ACCEPT);
-    // Patch fd at dword index 1 (byte offset 4)
-    zmm = _mm512_mask_set1_epi32(zmm, 1U << 1, fd);
-    // user_data is constant in template
-    _mm512_store_si512((__m512i *)sqe, zmm);
-}
+#define prep_send_direct(sqe, fd, buf, len, buf_idx) do { \
+    (void)(buf); (void)(len); \
+    PREP_SQE(sqe, SQE_TEMPLATE_SEND, fd, OP_SEND_SHIFTED | (u32)(fd) | ((u64)(buf_idx) << 40)); \
+} while (0)
 
-static inline void prep_recv_multishot_direct(struct io_uring_sqe *sqe, int fd) {
-    __m512i zmm = _mm512_load_si512((const __m512i *)&SQE_TEMPLATE_RECV);
-    // Patch fd at dword index 1 (byte offset 4)
-    zmm = _mm512_mask_set1_epi32(zmm, 1U << 1, fd);
-    // Patch user_data at qword index 4 (byte offset 32)
-    u64 ud = OP_RECV_SHIFTED | (u32)fd;
-    zmm = _mm512_mask_set1_epi64(zmm, 1U << 4, (long long)ud);
-    _mm512_store_si512((__m512i *)sqe, zmm);
-}
-
-static inline void prep_send_direct(struct io_uring_sqe *sqe, int fd,
-                                     const void *buf, u32 len,
-                                     u16 buf_idx) {
-    (void)buf; (void)len;  // Template has pre-set addr and len
-    __m512i zmm = _mm512_load_si512((const __m512i *)&SQE_TEMPLATE_SEND);
-    // Patch fd at dword index 1 (byte offset 4)
-    zmm = _mm512_mask_set1_epi32(zmm, 1U << 1, fd);
-    // Patch user_data at qword index 4 (byte offset 32)
-    u64 ud = OP_SEND_SHIFTED | (u32)fd | ((u64)buf_idx << 40);
-    zmm = _mm512_mask_set1_epi64(zmm, 1U << 4, (long long)ud);
-    _mm512_store_si512((__m512i *)sqe, zmm);
-}
-
-static inline void prep_close_direct(struct io_uring_sqe *sqe, int fd) {
-    __m512i zmm = _mm512_load_si512((const __m512i *)&SQE_TEMPLATE_CLOSE);
-    // Patch fd at dword index 1 (byte offset 4)
-    zmm = _mm512_mask_set1_epi32(zmm, 1U << 1, fd);
-    // Patch user_data at qword index 4 (byte offset 32)
-    u64 ud = OP_CLOSE_SHIFTED | (u32)fd;
-    zmm = _mm512_mask_set1_epi64(zmm, 1U << 4, (long long)ud);
-    _mm512_store_si512((__m512i *)sqe, zmm);
-}
+#define prep_close_direct(sqe, fd) \
+    PREP_SQE(sqe, SQE_TEMPLATE_CLOSE, fd, OP_CLOSE_SHIFTED | (u32)(fd))
 
 #ifdef ENABLE_ZC
-static inline void prep_send_zc_direct(struct io_uring_sqe *sqe, int fd,
-                                        u16 buf_idx) {
-    __m512i zmm = _mm512_load_si512((const __m512i *)&SQE_TEMPLATE_SEND_ZC);
-    zmm = _mm512_mask_set1_epi32(zmm, 1U << 1, fd);
-    u64 ud = OP_SEND_ZC_SHIFTED | (u32)fd | ((u64)buf_idx << 40);
-    zmm = _mm512_mask_set1_epi64(zmm, 1U << 4, (long long)ud);
-    _mm512_store_si512((__m512i *)sqe, zmm);
-}
+#define prep_send_zc_direct(sqe, fd, buf_idx) \
+    PREP_SQE(sqe, SQE_TEMPLATE_SEND_ZC, fd, OP_SEND_ZC_SHIFTED | (u32)(fd) | ((u64)(buf_idx) << 40))
 #endif
-
-#else  // AVX2 or scalar fallback
-
-#ifdef USE_AVX2
-
-static inline void prep_multishot_accept_direct(struct io_uring_sqe *sqe, int fd) {
-    __m256i lo = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_ACCEPT);
-    __m256i hi = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_ACCEPT + 1);
-    lo = _mm256_blend_epi32(lo, _mm256_set1_epi32(fd), 1 << 1);
-    _mm256_store_si256((__m256i *)sqe, lo);
-    _mm256_store_si256((__m256i *)sqe + 1, hi);
-}
-
-static inline void prep_recv_multishot_direct(struct io_uring_sqe *sqe, int fd) {
-    __m256i lo = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_RECV);
-    __m256i hi = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_RECV + 1);
-    lo = _mm256_blend_epi32(lo, _mm256_set1_epi32(fd), 1 << 1);
-    u64 ud = OP_RECV_SHIFTED | (u32)fd;
-    hi = _mm256_blend_epi32(hi, _mm256_set1_epi64x((long long)ud), 0x03);
-    _mm256_store_si256((__m256i *)sqe, lo);
-    _mm256_store_si256((__m256i *)sqe + 1, hi);
-}
-
-static inline void prep_send_direct(struct io_uring_sqe *sqe, int fd,
-                                     const void *buf, u32 len,
-                                     u16 buf_idx) {
-    (void)buf; (void)len;
-    __m256i lo = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_SEND);
-    __m256i hi = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_SEND + 1);
-    lo = _mm256_blend_epi32(lo, _mm256_set1_epi32(fd), 1 << 1);
-    u64 ud = OP_SEND_SHIFTED | (u32)fd | ((u64)buf_idx << 40);
-    hi = _mm256_blend_epi32(hi, _mm256_set1_epi64x((long long)ud), 0x03);
-    _mm256_store_si256((__m256i *)sqe, lo);
-    _mm256_store_si256((__m256i *)sqe + 1, hi);
-}
-
-static inline void prep_close_direct(struct io_uring_sqe *sqe, int fd) {
-    __m256i lo = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_CLOSE);
-    __m256i hi = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_CLOSE + 1);
-    lo = _mm256_blend_epi32(lo, _mm256_set1_epi32(fd), 1 << 1);
-    u64 ud = OP_CLOSE_SHIFTED | (u32)fd;
-    hi = _mm256_blend_epi32(hi, _mm256_set1_epi64x((long long)ud), 0x03);
-    _mm256_store_si256((__m256i *)sqe, lo);
-    _mm256_store_si256((__m256i *)sqe + 1, hi);
-}
-
-#ifdef ENABLE_ZC
-static inline void prep_send_zc_direct(struct io_uring_sqe *sqe, int fd,
-                                        u16 buf_idx) {
-    __m256i lo = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_SEND_ZC);
-    __m256i hi = _mm256_load_si256((const __m256i *)&SQE_TEMPLATE_SEND_ZC + 1);
-    lo = _mm256_blend_epi32(lo, _mm256_set1_epi32(fd), 1 << 1);
-    u64 ud = OP_SEND_ZC_SHIFTED | (u32)fd | ((u64)buf_idx << 40);
-    hi = _mm256_blend_epi32(hi, _mm256_set1_epi64x((long long)ud), 0x03);
-    _mm256_store_si256((__m256i *)sqe, lo);
-    _mm256_store_si256((__m256i *)sqe + 1, hi);
-}
-#endif
-
-#else  // Scalar fallback
-
-static inline void sqe_copy_64(struct io_uring_sqe *dst,
-                                const struct io_uring_sqe *src) {
-    *dst = *src;
-}
-
-static inline void prep_multishot_accept_direct(struct io_uring_sqe *sqe, int fd) {
-    sqe_copy_64(sqe, &SQE_TEMPLATE_ACCEPT);
-    sqe->fd = fd;
-}
-
-static inline void prep_recv_multishot_direct(struct io_uring_sqe *sqe, int fd) {
-    sqe_copy_64(sqe, &SQE_TEMPLATE_RECV);
-    sqe->fd = fd;
-    sqe->user_data = OP_RECV_SHIFTED | (u32)fd;
-}
-
-static inline void prep_send_direct(struct io_uring_sqe *sqe, int fd,
-                                     const void *buf, u32 len,
-                                     u16 buf_idx) {
-    (void)buf; (void)len;
-    sqe_copy_64(sqe, &SQE_TEMPLATE_SEND);
-    sqe->fd = fd;
-    sqe->user_data = OP_SEND_SHIFTED | (u32)fd | ((u64)buf_idx << 40);
-}
-
-static inline void prep_close_direct(struct io_uring_sqe *sqe, int fd) {
-    sqe_copy_64(sqe, &SQE_TEMPLATE_CLOSE);
-    sqe->fd = fd;
-    sqe->user_data = OP_CLOSE_SHIFTED | (u32)fd;
-}
-
-#ifdef ENABLE_ZC
-static inline void prep_send_zc_direct(struct io_uring_sqe *sqe, int fd,
-                                        u16 buf_idx) {
-    sqe_copy_64(sqe, &SQE_TEMPLATE_SEND_ZC);
-    sqe->fd = fd;
-    sqe->user_data = OP_SEND_ZC_SHIFTED | (u32)fd | ((u64)buf_idx << 40);
-}
-#endif
-
-#endif  /* USE_AVX2 / scalar */
-
-#endif  /* USE_AVX512 */
 
 /* SETSOCKOPT: Keep scalar - complex cmd area at offset 48, rare operation */
 static inline void prep_setsockopt_direct(struct io_uring_sqe *sqe, int idx,
