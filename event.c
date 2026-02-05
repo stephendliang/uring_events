@@ -414,7 +414,7 @@ static inline bool queue_send_zc(struct server_ctx *ctx, int fd,
         return false;
     }
 
-    void *buf = buf_ring_mgr_addr(&ctx->br_mgr, ctx->zc_grp, buf_idx);
+    void *buf = BUF_RING_ADDR(&ctx->br_mgr, ctx->zc_grp, buf_idx);
     u32 copy_len = (len > ZC_BUFFER_SIZE) ? ZC_BUFFER_SIZE : len;
     memcpy(buf, data, copy_len);
 
@@ -749,6 +749,8 @@ int main(int argc, char *argv[]) {
     ctx.br.buf_base = BUF_RING_DATA(&ctx.br_mgr, ctx.recv_grp);
     ctx.br.tail = ctx.recv_grp->tail;
     ctx.br.mask = ctx.recv_grp->mask;
+    ctx.br.buffer_size = ctx.recv_grp->buffer_size;
+    ctx.br.buffer_shift = ctx.recv_grp->buffer_shift;
 
     int listen_fd = create_listen_socket(port, cpu);
     if (listen_fd < 0) {
