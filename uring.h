@@ -50,32 +50,10 @@ enum {
     BUF_RING_MAX_BUFFERS = 8192,
 };
 
-/* Memory barriers - x86-TSO optimized
-   x86 loads are not reordered with other loads, stores are not reordered
-   with other stores. We only need compiler barriers + volatile for acquire/release. */
-#if defined(__x86_64__) || defined(__i386__)
-  // x86 has strong memory model - compiler barrier is sufficient
-  #define smp_load_acquire(p) ({              \
-      typeof(*(p)) ___v = *(volatile typeof(*(p)) *)(p); \
-      __asm__ __volatile__("" ::: "memory");  \
-      ___v;                                   \
-  })
-  #define smp_store_release(p, v) do {        \
-      __asm__ __volatile__("" ::: "memory");  \
-      *(volatile typeof(*(p)) *)(p) = (v);    \
-  } while (0)
-#else
-  // Generic (ARM, RISC-V) - use full atomic fences
-  #define smp_load_acquire(p) ({                              \
-      typeof(*(p)) ___v = *(volatile typeof(*(p)) *)(p);      \
-      __atomic_thread_fence(__ATOMIC_ACQUIRE);                \
-      ___v;                                                   \
-  })
-  #define smp_store_release(p, v) do {                        \
-      __atomic_thread_fence(__ATOMIC_RELEASE);                \
-      *(volatile typeof(*(p)) *)(p) = (v);                    \
-  } while (0)
-#endif
+/* Memory barriers — compiler intrinsics handle per-arch semantics:
+   x86-TSO: plain mov + compiler barrier. ARM/RISC-V: ldar/stlr or fence. */
+#define smp_load_acquire(p)     __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#define smp_store_release(p, v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
 
 // Ring structures - cache-line optimized layout
 struct uring_sq {
