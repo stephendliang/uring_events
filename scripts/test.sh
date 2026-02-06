@@ -295,32 +295,7 @@ build_server() {
 
     log_info "Compiler: $($CC --version | head -1)"
 
-    # Optimization flags per run.sh
-    local OPT_FLAGS=(
-        -O3
-        -march=native              # Use all CPU features available
-        -mtune=native              # Tune for this specific CPU
-        -fomit-frame-pointer       # Free up RBP register
-        -fno-stack-protector       # No stack canaries (perf)
-        -fno-plt                   # Direct calls, no PLT indirection
-        -ffast-math                # Aggressive FP optimizations
-        -flto                      # Link-time optimization
-        -fno-semantic-interposition # Better inlining with LTO
-        -fvisibility=hidden        # Hide symbols by default
-        -Wunused-function
-        -ffunction-sections
-        -fdata-sections
-        -Wl,--gc-sections
-        -DNDEBUG                   # Disable asserts
-    )
-
-    # Optional: PGO (Profile-Guided Optimization) - uncomment for 2-pass build
-    # PASS1: add -fprofile-generate, run workload, then
-    # PASS2: add -fprofile-use
-
-    log_info "Building with: ${OPT_FLAGS[*]}"
-
-    if $CC -std=gnu11 -Wall -Wextra -Werror "${OPT_FLAGS[@]}" "$SOURCE" -o "$BINARY" 2>&1; then
+    if make CC="$CC" 2>&1; then
         log_ok "Build succeeded!"
         ls -la "$BINARY"
     else
