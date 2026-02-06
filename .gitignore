@@ -1,1 +1,7 @@
 event
+.claude/
+build/
+*.o
+*.a
+*.so
+*.out

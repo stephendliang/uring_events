@@ -1,6 +1,7 @@
 #pragma once
 
-#include <stdint.h>
+#include "core.h"
+
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <string.h>
@@ -147,7 +148,7 @@ struct buf_ring {
     struct io_uring_buf_ring *br;
     u8 *buf_base;
     u16 tail;
-    u16 mask;              // NUM_BUFFERS - 1, cached
+    u16 mask;              // num_buffers - 1, cached
     u32 buffer_size;
     u32 buffer_shift;
 };
@@ -257,7 +258,7 @@ static int uring_mmap(struct uring *ring, struct io_uring_params *p) {
     return 0;
 }
 
-static int uring_init(struct uring *ring) {
+static int uring_init(struct uring *ring, u32 sq_entries, u32 cq_entries) {
     struct io_uring_params p;
     int ret;
 
@@ -271,16 +272,16 @@ static int uring_init(struct uring *ring) {
                 IORING_SETUP_CQSIZE;
 
     p.flags = flags | IORING_SETUP_NO_SQARRAY;
-    p.cq_entries = CQ_ENTRIES;
+    p.cq_entries = cq_entries;
 
-    ring->ring_fd = io_uring_setup(SQ_ENTRIES, &p);
+    ring->ring_fd = io_uring_setup(sq_entries, &p);
     if (ring->ring_fd < 0 && errno == EINVAL) {
         /* Kernel may not support NO_SQARRAY — retry without.
            Reset p fully since kernel may have partially modified it. */
         memset(&p, 0, sizeof(p));
         p.flags = flags;
-        p.cq_entries = CQ_ENTRIES;
-        ring->ring_fd = io_uring_setup(SQ_ENTRIES, &p);
+        p.cq_entries = cq_entries;
+        ring->ring_fd = io_uring_setup(sq_entries, &p);
     }
     if (unlikely(ring->ring_fd < 0))
         return -errno;

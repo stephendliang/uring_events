@@ -22,8 +22,9 @@ set -e
 
 PORT="${1:-8080}"
 CPU="${2:-0}"
-SOURCE="event.c"
-HEADER="uring.h"
+SOURCE="src/event.c"
+HEADER="src/uring.h"
+CORE_HEADER="src/core.h"
 BINARY="event"
 CC="${CC:-gcc}"
 
@@ -74,7 +75,11 @@ validate_source() {
         log_fatal "Header file '$HEADER' not found!"
     fi
 
-    log_info "Checking $SOURCE and $HEADER for critical patterns..."
+    if [ ! -f "$CORE_HEADER" ]; then
+        log_fatal "Core header '$CORE_HEADER' not found!"
+    fi
+
+    log_info "Checking $SOURCE, $HEADER, and $CORE_HEADER for critical patterns..."
 
     # ---------------------------------------------------------------------
     # CHECK 1: Multishot recv must have len=0

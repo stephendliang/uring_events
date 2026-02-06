@@ -22,12 +22,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 
-typedef uint8_t  u8;
-typedef uint16_t u16;
-typedef uint32_t u32;
-typedef uint64_t u64;
-typedef int32_t  i32;
-typedef int64_t  i64;
+#include "core.h"
 
 // SIMD infrastructure for SQE template copy
 
@@ -38,34 +33,6 @@ typedef int64_t  i64;
 #else
 #include "sqe_scalar.h"
 #endif
-
-// Debug/Logging macros - compiled out in production (NDEBUG)
-
-#ifdef DEBUG
-  #define LOG_INFO(fmt, ...)  fprintf(stderr, "[INFO] " fmt "\n", ##__VA_ARGS__)
-  #define LOG_WARN(fmt, ...)  fprintf(stderr, "[WARN] " fmt "\n", ##__VA_ARGS__)
-  #define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
-  #define LOG_BUG(fmt, ...)   fprintf(stderr, "[BUG] " fmt "\n", ##__VA_ARGS__)
-  #define DEBUG_ONLY(x)       x
-#else
-  #define LOG_INFO(fmt, ...)  ((void)0)
-  #define LOG_WARN(fmt, ...)  ((void)0)
-  #define LOG_ERROR(fmt, ...) ((void)0)
-  #define LOG_BUG(fmt, ...)   ((void)0)
-  #define DEBUG_ONLY(x)       ((void)0)
-#endif
-
-// Fatal errors that should crash even in production
-#define LOG_FATAL(fmt, ...) do { \
-    fprintf(stderr, "[FATAL] " fmt "\n", ##__VA_ARGS__); \
-} while(0)
-
-// Branch prediction hints
-#define likely(x)   __builtin_expect(!!(x), 1)
-#define unlikely(x) __builtin_expect(!!(x), 0)
-
-// Prefetch for read
-#define prefetch_r(addr) __builtin_prefetch((addr), 0, 3)
 
 // Configuration - All tunable at compile time
 
@@ -704,7 +671,7 @@ int main(int argc, char *argv[]) {
     // Initialize SEND template with runtime address
     SQE_TEMPLATE_SEND.addr = (u64)HTTP_200_RESPONSE;
 
-    int ret = uring_init(&ctx.ring);
+    int ret = uring_init(&ctx.ring, SQ_ENTRIES, CQ_ENTRIES);
     if (ret < 0) {
         LOG_FATAL("io_uring init: %d", ret);
         return 1;
