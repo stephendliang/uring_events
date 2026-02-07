@@ -10,11 +10,7 @@
 
 #define _GNU_SOURCE
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <fcntl.h>
 #include <sched.h>
-#include <limits.h>
 
 #include <signal.h>
 #include <sys/socket.h>
@@ -23,9 +19,10 @@
 #include <netinet/tcp.h>
 
 #include "core.h"
+#include "event.h"
+#include "util.h"
 
 // SIMD infrastructure for SQE template copy
-
 #if defined(__AVX512F__)
 #include "sqe_avx512.h"
 #elif defined(__AVX2__)
@@ -35,7 +32,6 @@
 #endif
 
 // Configuration - All tunable at compile time
-
 enum {
     SQ_ENTRIES      = 2048,
     CQ_ENTRIES      = SQ_ENTRIES * 4,
@@ -90,8 +86,7 @@ enum op_type {
 #define OP_SEND_ZC_SHIFTED    ((u64)OP_SEND_ZC << 32)
 #endif
 
-// SQE templates - 64-byte aligned for SIMD copy
-// fd and user_data will be patched per operation; everything else is constant.
+// SQE templates — 64-byte aligned for SIMD copy, fd/user_data patched per-op
 #define CACHE_ALIGN __attribute__((aligned(64)))
 
 CACHE_ALIGN
@@ -161,13 +156,13 @@ struct conn_state {
     u8 reserved : 6;
 };
 
-static struct conn_state g_conns[MAX_CONNECTIONS];
+CACHE_ALIGN static struct conn_state g_conns[MAX_CONNECTIONS];
 
 // Static value for async setsockopt - must persist across async operation
 static int g_tcp_nodelay_val = 1;
 
 static inline struct conn_state *get_conn(int fd) {
-    // Branchless bounds check - returns NULL for invalid fd
+    // Bounds check - returns NULL for invalid fd
     unsigned ufd = (unsigned)fd;
     return (ufd < MAX_CONNECTIONS) ? &g_conns[ufd] : NULL;
 }
@@ -196,38 +191,25 @@ static inline struct conn_state *get_conn(int fd) {
     PREP_SQE(sqe, SQE_TEMPLATE_SEND_ZC, fd, OP_SEND_ZC_SHIFTED | (u32)(fd) | ((u64)(buf_idx) << 40))
 #endif
 
-/* SETSOCKOPT: Keep scalar - complex cmd area at offset 48, rare operation */
+/* SETSOCKOPT: SIMD zero + scalar patches. SQEs are 64-byte aligned. */
 static inline void prep_setsockopt_direct(struct io_uring_sqe *sqe, int idx,
                                            int level, int optname,
                                            void *optval, int optlen) {
+    mem_zero_cacheline(sqe);
     sqe->opcode = IORING_OP_URING_CMD;
-    sqe->flags = IOSQE_CQE_SKIP_SUCCESS | IOSQE_FIXED_FILE;  // Fixed file for client socket
-    sqe->ioprio = 0;
-    sqe->fd = idx;  // Fixed file index
-    sqe->off = 0;  // cmd_op = SOCKET_URING_OP_SETSOCKOPT (0)
-    sqe->addr = 0;
-    sqe->len = 0;
-    sqe->rw_flags = 0;
+    sqe->flags = IOSQE_CQE_SKIP_SUCCESS | IOSQE_FIXED_FILE;
+    sqe->fd = idx;
     sqe->user_data = OP_SETSOCKOPT_SHIFTED | (u32)idx;
-    sqe->buf_group = 0;
-    sqe->personality = 0;
-    sqe->splice_fd_in = 0;
-    sqe->addr3 = 0;
-    sqe->__pad2[0] = 0;
-
-    // Socket command parameters in cmd array (offset 48 in SQE)
-    // Layout: level(4) | optname(4) | optlen(4) | pad(4) | optval(8)
+    // cmd area at offset 48: level(4)|optname(4)|optlen(4)|pad(4)|optval(8)
     u8 *cmd = (u8 *)sqe + 48;
     *(u32 *)(cmd + 0) = (u32)level;
     *(u32 *)(cmd + 4) = (u32)optname;
     *(u32 *)(cmd + 8) = (u32)optlen;
-    *(u32 *)(cmd + 12) = 0;  // padding
     *(u64 *)(cmd + 16) = (u64)(uintptr_t)optval;
 }
 
 // Listening socket setup (startup path - not performance critical)
-
-static int create_listen_socket(int port, int cpu) {
+static int create_listen_socket(u16 port, int cpu) {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (fd < 0) {
         LOG_FATAL("socket: %s", strerror(errno));
@@ -241,7 +223,7 @@ static int create_listen_socket(int port, int cpu) {
 
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
-        .sin_port = htons((u16)port),
+        .sin_port = htons(port),
         .sin_addr.s_addr = htonl(INADDR_ANY),
     };
 
@@ -295,7 +277,7 @@ static void signal_handler(int sig) {
         g_ctx->running = 0;
 }
 
-// Event handlers - HOT PATH, maximally optimized
+// Event handlers
 static inline bool queue_accept(struct server_ctx *ctx) {
     struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
     if (unlikely(!sqe)) {
@@ -513,7 +495,7 @@ static inline void handle_close(int fd) {
     }
 }
 
-// Main event loop - ULTRA HOT PATH
+// Main event loop
 static void event_loop(struct server_ctx *ctx) {
     struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 };  // 1ms
 
@@ -558,7 +540,6 @@ static void event_loop(struct server_ctx *ctx) {
             int32_t fd = decode_fd(ud);
             u8 op = decode_op(ud);
 
-            // Switch dispatch for operations
             switch (op) {
             case OP_ACCEPT:
                 handle_accept(ctx, cqe);
@@ -570,13 +551,12 @@ static void event_loop(struct server_ctx *ctx) {
                 break;
             case OP_SEND: {
                 u16 buf_idx = decode_buf_idx(ud);
-                // Inline buffer recycling with cached values for performance
+                // Recycle buffer
                 struct io_uring_buf *buf = &br_ring->bufs[br_tail & br_mask];
                 buf->addr = (u64)(br_base + ((u32)buf_idx << BUFFER_SHIFT));
                 buf->len = BUFFER_SIZE;
                 buf->bid = buf_idx;
                 br_tail++;
-                // Send completion error checking
                 int res = cqe->res;
                 if (unlikely(res < 0)) {
                     if (res != -EPIPE && res != -ECONNRESET && res != -EBADF && res != -ECANCELED)
@@ -618,32 +598,7 @@ static void event_loop(struct server_ctx *ctx) {
     LOG_INFO("Event loop exiting");
 }
 
-// Input validation (startup only)
-static int parse_int(const char *str, int min, int max, const char *name) {
-    char *end;
-    errno = 0;
-    long val = strtol(str, &end, 10);
-
-    if (errno || end == str || *end != '\0' || val < min || val > max) {
-        LOG_FATAL("Invalid %s: '%s' (must be %d-%d)", name, str, min, max);
-        return -1;
-    }
-    return (int)val;
-}
-
-int main(int argc, char *argv[]) {
-    int port = 8080;
-    int cpu = 0;
-
-    if (argc > 1) {
-        port = parse_int(argv[1], 1, 65535, "port");
-        if (port < 0) return 1;
-    }
-    if (argc > 2) {
-        cpu = parse_int(argv[2], 0, CPU_SETSIZE - 1, "cpu");
-        if (cpu < 0) return 1;
-    }
-
+int server_run(u16 port, int cpu) {
 #ifdef DEBUG
     fprintf(stderr, "=== DEBUG BUILD - NOT FOR PRODUCTION ===\n");
 #endif
@@ -658,8 +613,7 @@ int main(int argc, char *argv[]) {
     struct server_ctx ctx = { .running = 1 };
     g_ctx = &ctx;
 
-    // Clear connection state
-    memset(g_conns, 0, sizeof(g_conns));
+    mem_zero_aligned(g_conns, sizeof(g_conns));
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));

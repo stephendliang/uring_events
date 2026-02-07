@@ -16,13 +16,12 @@
 
 set -e
 
-# =============================================================================
 # Configuration
-# =============================================================================
 
 PORT="${1:-8080}"
 CPU="${2:-0}"
 SOURCE="src/event.c"
+SOURCE_MAIN="src/main.c"
 HEADER="src/uring.h"
 CORE_HEADER="src/core.h"
 BINARY="event"
@@ -35,9 +34,7 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# =============================================================================
 # Helper functions
-# =============================================================================
 
 log_info()  { echo -e "${BLUE}[INFO]${NC} $1"; }
 log_ok()    { echo -e "${GREEN}[OK]${NC} $1"; }
@@ -55,9 +52,7 @@ cleanup() {
 
 trap cleanup EXIT
 
-# =============================================================================
 # Phase 1: Source Code Validation
-# =============================================================================
 
 validate_source() {
     echo ""
@@ -79,12 +74,14 @@ validate_source() {
         log_fatal "Core header '$CORE_HEADER' not found!"
     fi
 
+    if [ ! -f "$SOURCE_MAIN" ]; then
+        log_fatal "Main source file '$SOURCE_MAIN' not found!"
+    fi
+
     log_info "Checking $SOURCE, $HEADER, and $CORE_HEADER for critical patterns..."
 
-    # ---------------------------------------------------------------------
     # CHECK 1: Multishot recv must have len=0
     # Your friend's mistake: adding length breaks multishot recv
-    # ---------------------------------------------------------------------
     if grep -n "prep_recv_multishot" "$SOURCE" | head -1 > /dev/null; then
         # Find the function and check sqe->len
         local recv_func=$(awk '/prep_recv_multishot/,/^}/' "$SOURCE")
@@ -100,9 +97,7 @@ validate_source() {
         fi
     fi
 
-    # ---------------------------------------------------------------------
     # CHECK 2: No liburing includes (we don't use liburing)
-    # ---------------------------------------------------------------------
     if grep -n '#include.*<liburing' "$SOURCE" "$HEADER" 2>/dev/null; then
         log_error "CRITICAL: Found liburing include!"
         log_error "         This server uses raw io_uring syscalls, not liburing"
@@ -111,9 +106,7 @@ validate_source() {
         log_ok "No liburing dependency (correct - raw syscalls)"
     fi
 
-    # ---------------------------------------------------------------------
     # CHECK 3: Required io_uring flags must be present (in source or header)
-    # ---------------------------------------------------------------------
     local required_flags=(
         "IORING_SETUP_SUBMIT_ALL"
         "IORING_SETUP_SINGLE_ISSUER"
@@ -131,9 +124,7 @@ validate_source() {
         fi
     done
 
-    # ---------------------------------------------------------------------
     # CHECK 4: Multishot accept must be present
-    # ---------------------------------------------------------------------
     if grep -q "IORING_ACCEPT_MULTISHOT" "$SOURCE"; then
         log_ok "Multishot accept enabled"
     else
@@ -141,9 +132,7 @@ validate_source() {
         errors=$((errors + 1))
     fi
 
-    # ---------------------------------------------------------------------
     # CHECK 5: Multishot recv must be present
-    # ---------------------------------------------------------------------
     if grep -q "IORING_RECV_MULTISHOT" "$SOURCE"; then
         log_ok "Multishot recv enabled"
     else
@@ -151,9 +140,7 @@ validate_source() {
         errors=$((errors + 1))
     fi
 
-    # ---------------------------------------------------------------------
     # CHECK 6: Buffer select must be present (for provided buffers)
-    # ---------------------------------------------------------------------
     if grep -q "IOSQE_BUFFER_SELECT" "$SOURCE"; then
         log_ok "Buffer select enabled (provided buffer ring)"
     else
@@ -161,18 +148,14 @@ validate_source() {
         errors=$((errors + 1))
     fi
 
-    # ---------------------------------------------------------------------
     # CHECK 7: TCP_NODELAY should be set
-    # ---------------------------------------------------------------------
     if grep -q "TCP_NODELAY" "$SOURCE"; then
         log_ok "TCP_NODELAY found"
     else
         log_warn "TCP_NODELAY not found (recommended per CLAUDE.md)"
     fi
 
-    # ---------------------------------------------------------------------
     # CHECK 8: No SQPOLL (explicitly avoided per CLAUDE.md)
-    # ---------------------------------------------------------------------
     if grep -q "IORING_SETUP_SQPOLL" "$SOURCE" "$HEADER" 2>/dev/null; then
         log_warn "SQPOLL found - per CLAUDE.md this should be avoided"
         log_warn "         'Kernel polling threads burn CPU and fight for cache'"
@@ -180,9 +163,7 @@ validate_source() {
         log_ok "No SQPOLL (correct per CLAUDE.md)"
     fi
 
-    # ---------------------------------------------------------------------
     # CHECK 9: HTTP response exists
-    # ---------------------------------------------------------------------
     if grep -q "HTTP/1.1 200" "$SOURCE"; then
         log_ok "HTTP 200 response found"
     else
@@ -190,63 +171,49 @@ validate_source() {
         errors=$((errors + 1))
     fi
 
-    # ---------------------------------------------------------------------
     # CHECK 10: Memory barriers present (for correct ring operation)
-    # ---------------------------------------------------------------------
     if grep -q "ATOMIC_ACQUIRE\|ATOMIC_RELEASE\|smp_load_acquire\|smp_store_release" "$SOURCE" "$HEADER" 2>/dev/null; then
         log_ok "Memory barriers present"
     else
         log_warn "No memory barriers found - may cause race conditions"
     fi
 
-    # ---------------------------------------------------------------------
     # CHECK 11: Double-close prevention (connection state tracking)
-    # ---------------------------------------------------------------------
     if grep -q "closing.*:.*1\|conn_state\|double.close\|Prevent double" "$SOURCE"; then
         log_ok "Double-close prevention present"
     else
         log_warn "No double-close prevention found - may cause EBADF errors"
     fi
 
-    # ---------------------------------------------------------------------
     # CHECK 12: ENOBUFS handling (must re-arm recv on buffer exhaustion)
-    # ---------------------------------------------------------------------
     if grep -A5 "ENOBUFS" "$SOURCE" | grep -q "add_recv\|rearm"; then
         log_ok "ENOBUFS handling re-arms recv"
     else
         log_warn "ENOBUFS may not re-arm recv - connections could hang"
     fi
 
-    # ---------------------------------------------------------------------
     # CHECK 13: Input validation (port/CPU bounds checking)
-    # ---------------------------------------------------------------------
-    if grep -q "parse_port\|strtol\|65535" "$SOURCE"; then
+    if grep -q "parse_int\|65535" "$SOURCE" "$SOURCE_MAIN"; then
         log_ok "Input validation present"
     else
         log_warn "No input validation - invalid args may cause issues"
     fi
 
-    # ---------------------------------------------------------------------
     # CHECK 14: Signal handling (graceful shutdown)
-    # ---------------------------------------------------------------------
     if grep -q "signal_handler\|SIGINT\|SIGTERM\|sigaction" "$SOURCE"; then
         log_ok "Signal handling present (graceful shutdown)"
     else
         log_warn "No signal handling - Ctrl+C will not cleanup properly"
     fi
 
-    # ---------------------------------------------------------------------
     # CHECK 15: Buffer index validation
-    # ---------------------------------------------------------------------
     if grep -q "buf_idx.*>=.*NUM_BUFFERS\|bid.*>=.*buf_cnt\|invalid buffer" "$SOURCE"; then
         log_ok "Buffer index validation present"
     else
         log_warn "No buffer index validation - kernel bugs could cause OOB access"
     fi
 
-    # ---------------------------------------------------------------------
     # CHECK 16: SQ full handling (no mid-loop syscalls per CLAUDE.md)
-    # ---------------------------------------------------------------------
     if grep -q "SQ full" "$SOURCE"; then
         log_ok "SQ full handling present"
         # Verify we're NOT doing mid-loop syscalls (actual calls, not comments)
@@ -257,18 +224,14 @@ validate_source() {
         log_warn "No SQ full handling - may leak resources under load"
     fi
 
-    # ---------------------------------------------------------------------
     # CHECK 17: Partial send handling
-    # ---------------------------------------------------------------------
     if grep -q "Partial send\|res.*<.*HTTP_200_LEN" "$SOURCE"; then
         log_ok "Partial send handling present"
     else
         log_warn "No partial send handling - clients may receive truncated responses"
     fi
 
-    # ---------------------------------------------------------------------
     # CHECK 18: Static assertions for compile-time validation
-    # ---------------------------------------------------------------------
     if grep -q "_Static_assert\|static_assert" "$SOURCE"; then
         log_ok "Compile-time assertions present"
     else
@@ -283,9 +246,7 @@ validate_source() {
     fi
 }
 
-# =============================================================================
 # Phase 2: Build
-# =============================================================================
 
 build_server() {
     echo ""
@@ -303,9 +264,7 @@ build_server() {
     fi
 }
 
-# =============================================================================
 # Phase 3: Hugepage Setup
-# =============================================================================
 
 setup_hugepages() {
     echo ""
@@ -343,9 +302,7 @@ setup_hugepages() {
     fi
 }
 
-# =============================================================================
 # Phase 4: Run Server
-# =============================================================================
 
 start_server() {
     echo ""
@@ -381,9 +338,7 @@ start_server() {
     fi
 }
 
-# =============================================================================
 # Phase 5: Test
-# =============================================================================
 
 test_server() {
     echo ""
@@ -393,9 +348,7 @@ test_server() {
 
     local test_failures=0
 
-    # -------------------------------------------------------------------------
     # TEST 1: Basic HTTP request
-    # -------------------------------------------------------------------------
     log_info "Test 1: Basic HTTP request..."
 
     local response
@@ -412,9 +365,7 @@ test_server() {
         test_failures=$((test_failures + 1))
     fi
 
-    # -------------------------------------------------------------------------
     # TEST 2: Multiple sequential requests
-    # -------------------------------------------------------------------------
     log_info "Test 2: Sequential requests (10x)..."
 
     local success=0
@@ -431,9 +382,7 @@ test_server() {
         test_failures=$((test_failures + 1))
     fi
 
-    # -------------------------------------------------------------------------
     # TEST 3: Concurrent requests
-    # -------------------------------------------------------------------------
     log_info "Test 3: Concurrent requests (20 parallel)..."
 
     local pids=()
@@ -466,9 +415,7 @@ test_server() {
         test_failures=$((test_failures + 1))
     fi
 
-    # -------------------------------------------------------------------------
     # TEST 4: Keep-alive (multiple requests on same connection)
-    # -------------------------------------------------------------------------
     log_info "Test 4: Keep-alive (5 requests, 1 connection)..."
 
     local keepalive_response
@@ -489,9 +436,7 @@ test_server() {
         test_failures=$((test_failures + 1))
     fi
 
-    # -------------------------------------------------------------------------
     # TEST 5: Response time check
-    # -------------------------------------------------------------------------
     log_info "Test 5: Response time..."
 
     local time_output
@@ -507,9 +452,7 @@ test_server() {
         log_warn "Response time >= 100ms (may indicate issues)"
     fi
 
-    # -------------------------------------------------------------------------
     # TEST 6: Server still running after all tests
-    # -------------------------------------------------------------------------
     log_info "Test 6: Server stability check..."
 
     if kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -519,9 +462,7 @@ test_server() {
         test_failures=$((test_failures + 1))
     fi
 
-    # -------------------------------------------------------------------------
     # Results
-    # -------------------------------------------------------------------------
     echo ""
     if [ $test_failures -eq 0 ]; then
         log_ok "All tests passed!"
@@ -532,9 +473,7 @@ test_server() {
     return $test_failures
 }
 
-# =============================================================================
 # Phase 6: Report
-# =============================================================================
 
 report() {
     echo ""
@@ -562,9 +501,7 @@ report() {
     log_info "To test manually: curl http://localhost:$PORT/"
 }
 
-# =============================================================================
 # Main
-# =============================================================================
 
 main() {
     echo ""

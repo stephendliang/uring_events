@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core.h"
+#include "util.h"
 
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -238,9 +239,7 @@ static int uring_mmap(struct uring *ring, struct io_uring_params *p) {
         /* Pre-fill SQ array with identity mapping.
            Since we use SINGLE_ISSUER, sequential allocation, and contiguous submission,
            array[n % size] = n % size is always correct. This enables O(1) submit. */
-        for (u32 i = 0; i < sq->ring_entries; i++) {
-            sq->array[i] = i;
-        }
+        mem_iota_u32(sq->array, sq->ring_entries);
     }
 
     // Setup CQ pointers
@@ -391,7 +390,7 @@ static int uring_register_fixed_files(struct uring *ring, u32 count) {
     if (fds == MAP_FAILED)
         return -errno;
 
-    memset(fds, -1, size);  // -1 = empty slot
+    mem_fill_nt(fds, 0xFF, size);  // -1 = empty slot
 
     int ret = io_uring_register(ring->ring_fd, IORING_REGISTER_FILES, fds, count);
     munmap(fds, size);  // Kernel copied it, we can free
