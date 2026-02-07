@@ -2,21 +2,17 @@
 
 #include "core.h"
 
-/*
- * SIMD memory primitives — 3-tier dispatch (AVX-512 / AVX2 / scalar).
- *
- * All "aligned" / "nt" variants require:
- *   - dst (and src) 64-byte aligned
- *   - n is a multiple of 64 bytes
- *
- * Non-temporal (NT) variants bypass cache — use for large buffers that
- * won't be read soon by userspace (e.g., passed to kernel then munmap'd).
- */
+// SIMD memory primitives — 3-tier dispatch (AVX-512 / AVX2 / scalar).
+//
+// All "aligned" / "nt" variants require:
+//   - dst (and src) 64-byte aligned
+//   - n is a multiple of 64 bytes
+//
+// Non-temporal (NT) variants bypass cache — use for large buffers that
+// won't be read soon by userspace (e.g., passed to kernel then munmap'd).
 
 #if defined(__AVX512F__)
-/* ================================================================
- * AVX-512: one 64-byte store per cache line
- * ================================================================ */
+// AVX-512: one 64-byte store per cache line
 #include <immintrin.h>
 
 #pragma GCC push_options
@@ -99,9 +95,7 @@ static inline void mem_iota_u32(u32 *dst, u32 n) {
 #pragma GCC pop_options
 
 #elif defined(__AVX2__)
-/* ================================================================
- * AVX2: two 32-byte stores per cache line
- * ================================================================ */
+// AVX2: two 32-byte stores per cache line
 #include <immintrin.h>
 
 #pragma GCC push_options
@@ -193,10 +187,8 @@ static inline void mem_iota_u32(u32 *dst, u32 n) {
 #pragma GCC pop_options
 
 #else
-/* ================================================================
- * Scalar: explicit loops — __builtin_memset/memcpy emit glibc calls
- * for sizes > ~512B. The pragma prevents GCC from converting loops back.
- * ================================================================ */
+// Scalar: explicit loops — __builtin_memset/memcpy emit glibc calls
+// for sizes > ~512B. The pragma prevents GCC from converting loops back.
 
 #pragma GCC push_options
 #pragma GCC optimize("no-tree-loop-distribute-patterns")
@@ -236,7 +228,7 @@ static inline void mem_copy_nt(void *restrict dst,
     while (s < end) { *(u64 *)d = *(const u64 *)s; s += 8; d += 8; }
 }
 
-/* 64B constant — GCC always inlines this as store sequence */
+// 64B constant — GCC always inlines this as store sequence
 static inline void mem_zero_cacheline(void *dst) {
     __builtin_memset(dst, 0, 64);
 }
@@ -249,3 +241,19 @@ static inline void mem_iota_u32(u32 *dst, u32 n) {
 #pragma GCC pop_options
 
 #endif
+
+// Unaligned-safe u64 — generates identical mov on x86-64
+typedef u64 __attribute__((aligned(1))) u64_ua;
+
+// Byte-granular copy for arbitrary sizes (e.g., ZC send path).
+// Not aligned, not SIMD — for small copies only (<4KB).
+#pragma GCC push_options
+#pragma GCC optimize("no-tree-loop-distribute-patterns")
+static inline void mem_copy_small(void *restrict dst,
+                                   const void *restrict src, u32 n) {
+    u8 *d = (u8 *)dst;
+    const u8 *s = (const u8 *)src;
+    while (n >= 8) { *(u64_ua *)d = *(const u64_ua *)s; d += 8; s += 8; n -= 8; }
+    while (n--) *d++ = *s++;
+}
+#pragma GCC pop_options

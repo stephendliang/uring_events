@@ -5,12 +5,15 @@
 
 #include <stdatomic.h>
 #include <stdbool.h>
+
+#ifndef NOLIBC
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
-
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#endif
+
 #include <linux/io_uring.h>
 #include <linux/time_types.h>
 
@@ -52,8 +55,8 @@ enum {
     BUF_RING_MAX_BUFFERS = 8192,
 };
 
-/* Memory barriers — compiler intrinsics handle per-arch semantics:
-   x86-TSO: plain mov + compiler barrier. ARM/RISC-V: ldar/stlr or fence. */
+// Memory barriers — compiler intrinsics handle per-arch semantics:
+// x86-TSO: plain mov + compiler barrier. ARM/RISC-V: ldar/stlr or fence.
 #define smp_load_acquire(p)     __atomic_load_n((p), __ATOMIC_ACQUIRE)
 #define smp_store_release(p, v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
 
@@ -114,9 +117,7 @@ struct buf_ring_config {
     u16 bgid;              // Buffer group ID for kernel registration
     u32 buffer_size;       // Size of each buffer
     u32 buffer_shift;      // log2(buffer_size) for fast address calc
-#ifdef ENABLE_ZC
     u8 is_zc;              // Zerocopy mode (bitmap tracking)
-#endif
 };
 
 // Per-group descriptor - offsets into shared allocation
@@ -129,11 +130,9 @@ struct buf_ring_group {
     u32 buffer_shift;      // log2(buffer_size)
     u32 ring_offset;       // Offset into shared mmap for ring header
     u32 data_offset;       // Offset into shared mmap for buffer data
-#ifdef ENABLE_ZC
     u8 is_zc;              // Zerocopy mode flag
     u16 free_count;        // Number of free buffers (ZC only)
-    uint64_t free_bitmap[BUF_RING_MAX_BUFFERS / 64];  // 1=free, 0=in-flight
-#endif
+    u64 free_bitmap[BUF_RING_MAX_BUFFERS / 64];  // 1=free, 0=in-flight
 };
 
 // Unified buffer ring manager - single mmap for all groups
@@ -165,21 +164,37 @@ struct buf_ring {
     (BUF_RING_DATA(mgr, grp) + ((u32)(idx) << (grp)->buffer_shift))
 
 // syscall wrappers; no liburing
+#ifdef NOLIBC
+#define io_uring_setup(entries, params) \
+    sys_io_uring_setup((entries), (params))
+#define io_uring_register(fd, opcode, arg, nr_args) \
+    sys_io_uring_register((fd), (opcode), (arg), (nr_args))
+#else
 #define io_uring_setup(entries, params) \
     (int)syscall(__NR_io_uring_setup, (entries), (params))
-
 #define io_uring_register(fd, opcode, arg, nr_args) \
     (int)syscall(__NR_io_uring_register, (fd), (opcode), (arg), (nr_args))
+#endif
+
+// mmap error checking — raw syscalls return negative errno in pointer,
+// glibc returns MAP_FAILED and sets errno. These macros unify both.
+#ifdef NOLIBC
+#define IS_MMAP_ERR(p) ((unsigned long)(p) >= (unsigned long)-4095UL)
+#define MMAP_ERR(p)    ((int)(long)(p))
+#else
+#define IS_MMAP_ERR(p) ((p) == MAP_FAILED)
+#define MMAP_ERR(p)    (-errno)
+#endif
 
 // io_uring initialization
-static int uring_mmap(struct uring *ring, struct io_uring_params *p) {
+static int uring_mmap(struct uring *ring, const struct io_uring_params *p) {
     struct uring_sq *sq = &ring->sq;
     struct uring_cq *cq = &ring->cq;
     size_t size;
     int ret;
 
-    /* SQ ring mapping.
-       With NO_SQARRAY, sq_off.array is 0, so use CQ end as size. */
+    // SQ ring mapping.
+    // With NO_SQARRAY, sq_off.array is 0, so use CQ end as size.
     if (p->flags & IORING_SETUP_NO_SQARRAY)
         size = p->cq_off.cqes + p->cq_entries * sizeof(struct io_uring_cqe);
     else
@@ -188,8 +203,8 @@ static int uring_mmap(struct uring *ring, struct io_uring_params *p) {
     sq->ring_ptr = (u8 *)mmap(NULL, size, PROT_READ | PROT_WRITE,
                               MAP_SHARED | MAP_POPULATE, ring->ring_fd,
                               IORING_OFF_SQ_RING);
-    if (unlikely(sq->ring_ptr == MAP_FAILED))
-        return -errno;
+    if (unlikely(IS_MMAP_ERR(sq->ring_ptr)))
+        return MMAP_ERR(sq->ring_ptr);
 
     // CQ ring mapping
     // With SINGLE_MMAP (common), SQ and CQ share one map.
@@ -202,8 +217,8 @@ static int uring_mmap(struct uring *ring, struct io_uring_params *p) {
         cq->ring_ptr = (u8 *)mmap(NULL, size, PROT_READ | PROT_WRITE,
                                   MAP_SHARED | MAP_POPULATE, ring->ring_fd,
                                   IORING_OFF_CQ_RING);
-        if (unlikely(cq->ring_ptr == MAP_FAILED)) {
-            ret = -errno;
+        if (unlikely(IS_MMAP_ERR(cq->ring_ptr))) {
+            ret = MMAP_ERR(cq->ring_ptr);
             munmap(sq->ring_ptr, sq->ring_sz);
             return ret;
         }
@@ -214,8 +229,8 @@ static int uring_mmap(struct uring *ring, struct io_uring_params *p) {
     sq->sqes = mmap(NULL, size, PROT_READ | PROT_WRITE,
                     MAP_SHARED | MAP_POPULATE, ring->ring_fd,
                     IORING_OFF_SQES);
-    if (unlikely(sq->sqes == MAP_FAILED)) {
-        ret = -errno;
+    if (unlikely(IS_MMAP_ERR(sq->sqes))) {
+        ret = MMAP_ERR(sq->sqes);
         if (cq->ring_sz)
             munmap(cq->ring_ptr, cq->ring_sz);
         munmap(sq->ring_ptr, sq->ring_sz);
@@ -236,9 +251,9 @@ static int uring_mmap(struct uring *ring, struct io_uring_params *p) {
 
     if (!(p->flags & IORING_SETUP_NO_SQARRAY)) {
         sq->array = (u32 *)(sq->ring_ptr + p->sq_off.array);
-        /* Pre-fill SQ array with identity mapping.
-           Since we use SINGLE_ISSUER, sequential allocation, and contiguous submission,
-           array[n % size] = n % size is always correct. This enables O(1) submit. */
+        // Pre-fill SQ array with identity mapping.
+        // Since we use SINGLE_ISSUER, sequential allocation, and contiguous submission,
+        // array[n % size] = n % size is always correct. This enables O(1) submit.
         mem_iota_u32(sq->array, sq->ring_entries);
     }
 
@@ -258,11 +273,9 @@ static int uring_mmap(struct uring *ring, struct io_uring_params *p) {
 }
 
 static int uring_init(struct uring *ring, u32 sq_entries, u32 cq_entries) {
-    struct io_uring_params p;
+    struct io_uring_params p = {0};
+    *ring = (struct uring){0};
     int ret;
-
-    memset(&p, 0, sizeof(p));
-    memset(ring, 0, sizeof(*ring));
 
     u32 flags = IORING_SETUP_SUBMIT_ALL |
                 IORING_SETUP_SINGLE_ISSUER |
@@ -274,16 +287,24 @@ static int uring_init(struct uring *ring, u32 sq_entries, u32 cq_entries) {
     p.cq_entries = cq_entries;
 
     ring->ring_fd = io_uring_setup(sq_entries, &p);
+#ifdef NOLIBC
+    if (ring->ring_fd == -EINVAL) {
+#else
     if (ring->ring_fd < 0 && errno == EINVAL) {
-        /* Kernel may not support NO_SQARRAY — retry without.
-           Reset p fully since kernel may have partially modified it. */
-        memset(&p, 0, sizeof(p));
+#endif
+        // Kernel may not support NO_SQARRAY — retry without.
+        // Reset p fully since kernel may have partially modified it.
+        p = (struct io_uring_params){0};
         p.flags = flags;
         p.cq_entries = cq_entries;
         ring->ring_fd = io_uring_setup(sq_entries, &p);
     }
     if (unlikely(ring->ring_fd < 0))
+#ifdef NOLIBC
+        return ring->ring_fd;
+#else
         return -errno;
+#endif
 
     ring->features = p.features;
     ring->flags = p.flags;  // Store what kernel accepted
@@ -317,9 +338,9 @@ static inline struct io_uring_sqe *uring_get_sqe(struct uring *ring) {
     return sqe;
 }
 
-/* O(1) submit - relies on identity mapping array[n] = n pre-filled at init.
-   Invariant: ktail == sqe_head at entry (SINGLE_ISSUER + sequential alloc).
-   Requirements: SINGLE_ISSUER, sequential allocation, contiguous submission. */
+// O(1) submit - relies on identity mapping array[n] = n pre-filled at init.
+// Invariant: ktail == sqe_head at entry (SINGLE_ISSUER + sequential alloc).
+// Requirements: SINGLE_ISSUER, sequential allocation, contiguous submission.
 static inline int uring_submit(struct uring *ring) {
     struct uring_sq *sq = &ring->sq;
     u32 to_submit = sq->sqe_tail - sq->sqe_head;
@@ -340,18 +361,23 @@ static inline int uring_submit_and_wait(struct uring *ring,
     int to_submit = uring_submit(ring);
     unsigned flags = IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG;
 
-    /* Pre-zeroed template avoids memset on every iteration.
-       Only sigmask_sz and ts need values; rest must be 0 for kernel. */
+    // Pre-zeroed template avoids memset on every iteration.
+    // Only sigmask_sz and ts need values; rest must be 0 for kernel.
     struct io_uring_getevents_arg arg = {
         .sigmask_sz = _NSIG / 8,
-        .ts = (uint64_t)ts,
+        .ts = (u64)ts,
     };
 
+#ifdef NOLIBC
+    long ret = sys_io_uring_enter(ring->ring_fd, to_submit, wait_nr,
+                                   flags, &arg, sizeof(arg));
+#else
     long ret = syscall(__NR_io_uring_enter, ring->ring_fd, to_submit, wait_nr,
                        flags, &arg, sizeof(arg));
+    if (ret < 0) ret = -errno;
+#endif
 
     if (unlikely(ret < 0)) {
-        ret = -errno;
         if (ret != -ETIME && ret != -EINTR)
             return (int)ret;
     }
@@ -359,16 +385,16 @@ static inline int uring_submit_and_wait(struct uring *ring,
     return to_submit;
 }
 
-/* Hot path - inline, no validation in production
-   IMPORTANT: Does NOT issue memory barrier. Caller MUST call buf_ring_sync()
-   after batching recycles to make buffers visible to kernel. */
+// Hot path - inline, no validation in production
+// IMPORTANT: Does NOT issue memory barrier. Caller MUST call buf_ring_sync()
+// after batching recycles to make buffers visible to kernel.
 static inline void buf_ring_recycle(struct buf_ring *br, u16 bid) {
     DEBUG_ONLY(if (bid > br->mask) { LOG_BUG("invalid bid %u", bid); return; });
 
     u16 tail = br->tail;
     struct io_uring_buf *buf = &br->br->bufs[tail & br->mask];
 
-    buf->addr = (uint64_t)(br->buf_base + ((u32)bid << br->buffer_shift));
+    buf->addr = (u64)(br->buf_base + ((u32)bid << br->buffer_shift));
     buf->len = br->buffer_size;
     buf->bid = bid;
 
@@ -387,8 +413,8 @@ static int uring_register_fixed_files(struct uring *ring, u32 count) {
     size_t size = count * sizeof(int);
     int *fds = mmap(NULL, size, PROT_READ | PROT_WRITE,
                     MAP_ANONYMOUS | MAP_PRIVATE | MAP_POPULATE, -1, 0);
-    if (fds == MAP_FAILED)
-        return -errno;
+    if (IS_MMAP_ERR(fds))
+        return MMAP_ERR(fds);
 
     mem_fill_nt(fds, 0xFF, size);  // -1 = empty slot
 
@@ -401,9 +427,8 @@ static int uring_register_fixed_files(struct uring *ring, u32 count) {
 // Register a single buffer ring with kernel
 static inline int buf_ring_register(struct uring *ring, void *ring_addr,
                                      u16 num_entries, u16 bgid) {
-    struct io_uring_buf_reg reg;
-    memset(&reg, 0, sizeof(reg));
-    reg.ring_addr = (uint64_t)ring_addr;
+    struct io_uring_buf_reg reg = {0};
+    reg.ring_addr = (u64)ring_addr;
     reg.ring_entries = num_entries;
     reg.bgid = bgid;
     return io_uring_register(ring->ring_fd, IORING_REGISTER_PBUF_RING, &reg, 1);
@@ -422,7 +447,7 @@ static int buf_ring_mgr_init(struct uring *ring, struct buf_ring_mgr *mgr,
     if (num_configs > BUF_RING_MAX_GROUPS)
         return -EINVAL;
 
-    memset(mgr, 0, sizeof(*mgr));
+    *mgr = (struct buf_ring_mgr){0};
 
     // Calculate total size needed for all groups
     size_t total = 0;
@@ -438,12 +463,12 @@ static int buf_ring_mgr_init(struct uring *ring, struct buf_ring_mgr *mgr,
     // Attempt mmap with huge pages
     void *ptr = mmap(NULL, total, PROT_READ | PROT_WRITE,
                      MAP_ANONYMOUS | MAP_PRIVATE | MAP_HUGETLB, -1, 0);
-    if (ptr == MAP_FAILED) {
+    if (IS_MMAP_ERR(ptr)) {
         LOG_WARN("huge pages unavailable for buf_ring_mgr, falling back");
         ptr = mmap(NULL, total, PROT_READ | PROT_WRITE,
                    MAP_ANONYMOUS | MAP_PRIVATE | MAP_POPULATE, -1, 0);
-        if (ptr == MAP_FAILED)
-            return -errno;
+        if (IS_MMAP_ERR(ptr))
+            return MMAP_ERR(ptr);
     }
 
     mgr->base = ptr;
@@ -477,23 +502,20 @@ static int buf_ring_mgr_init(struct uring *ring, struct buf_ring_mgr *mgr,
             return ret;
         }
 
-#ifdef ENABLE_ZC
         if (configs[i].is_zc) {
             g->is_zc = 1;
             g->free_count = g->num_buffers;
-            memset(g->free_bitmap, 0xFF, sizeof(g->free_bitmap));
+            __builtin_memset(g->free_bitmap, 0xFF, sizeof(g->free_bitmap));
             // Clear trailing bits if not power-of-64 aligned
             u16 trailing = g->num_buffers & 63;
             if (trailing)
                 g->free_bitmap[(g->num_buffers - 1) >> 6] &= (1ULL << trailing) - 1;
-        } else
-#endif
-        {
+        } else {
             // Init buffers for recv mode (pre-fill ring)
             struct io_uring_buf_ring *br = BUF_RING_PTR(mgr, g);
             for (u32 j = 0; j < g->num_buffers; j++) {
                 struct io_uring_buf *buf = &br->bufs[g->tail & g->mask];
-                buf->addr = (uint64_t)BUF_RING_ADDR(mgr, g, j);
+                buf->addr = (u64)BUF_RING_ADDR(mgr, g, j);
                 buf->len = g->buffer_size;
                 buf->bid = (u16)j;
                 g->tail++;
@@ -529,14 +551,19 @@ static inline void buf_ring_mgr_sync(struct buf_ring_mgr *mgr,
 }
 
 // Zerocopy buffer operations
-#ifdef ENABLE_ZC
 
 // Bitmap operations
-#define zc_bitmap_set(bitmap, idx) (bitmap)[(idx) >> 6] |= (1ULL << ((idx) & 63))
-#define zc_bitmap_clear(bitmap, idx) (bitmap)[(idx) >> 6] &= ~(1ULL << ((idx) & 63))
-#define zc_bitmap_test(bitmap, idx) (((bitmap)[(idx) >> 6] >> ((idx) & 63)) & 1)
+static inline void zc_bitmap_set(u64 *bitmap, u16 idx) {
+    bitmap[idx >> 6] |= (1ULL << (idx & 63));
+}
+static inline void zc_bitmap_clear(u64 *bitmap, u16 idx) {
+    bitmap[idx >> 6] &= ~(1ULL << (idx & 63));
+}
+static inline int zc_bitmap_test(const u64 *bitmap, u16 idx) {
+    return (bitmap[idx >> 6] >> (idx & 63)) & 1;
+}
 
-static inline int zc_bitmap_ffs(const uint64_t *bitmap, u16 count) {
+static inline int zc_bitmap_ffs(const u64 *bitmap, u16 count) {
     u16 words = (count + 63) / 64;
     for (u16 i = 0; i < words; i++) {
         if (bitmap[i]) {
@@ -578,7 +605,7 @@ static inline void buf_ring_zc_push(struct buf_ring_mgr *mgr,
                                      u16 bid, u32 len) {
     struct io_uring_buf_ring *br = BUF_RING_PTR(mgr, g);
     struct io_uring_buf *buf = &br->bufs[g->tail & g->mask];
-    buf->addr = (uint64_t)BUF_RING_ADDR(mgr, g, bid);
+    buf->addr = (u64)BUF_RING_ADDR(mgr, g, bid);
     buf->len = len;
     buf->bid = bid;
     g->tail++;
@@ -591,10 +618,10 @@ static inline int buf_ring_zc_probe(struct uring *ring) {
 
     struct io_uring_probe *probe = mmap(NULL, probe_size, PROT_READ | PROT_WRITE,
                                          MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    if (probe == MAP_FAILED)
+    if (IS_MMAP_ERR(probe))
         return -ENOMEM;
 
-    memset(probe, 0, probe_size);
+    mem_zero_aligned(probe, (probe_size + 63) & ~(size_t)63);
     probe->last_op = 255;
 
     int ret = io_uring_register(ring->ring_fd, IORING_REGISTER_PROBE, probe, 256);
@@ -609,5 +636,3 @@ static inline int buf_ring_zc_probe(struct uring *ring) {
     munmap(probe, probe_size);
     return supported ? 0 : -EOPNOTSUPP;
 }
-
-#endif // ENABLE_ZC

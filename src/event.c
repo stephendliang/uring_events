@@ -1,22 +1,20 @@
-/*
-  Raw io_uring HTTP server - No liburing, maximum performance
-  - Shared-nothing per-core isolation
-  - No liburing (direct syscalls + ring manipulation)
-  - IORING_SETUP_SUBMIT_ALL, SINGLE_ISSUER, DEFER_TASKRUN, COOP_TASKRUN
-  - Multishot accept + multishot recv with provided buffers
-  - Zero allocation in hot path
-  - Zero context switches in steady state
- */
+// Raw io_uring HTTP server - No liburing, maximum performance
+//  - Shared-nothing per-core isolation
+//  - No liburing (direct syscalls + ring manipulation)
+//  - IORING_SETUP_SUBMIT_ALL, SINGLE_ISSUER, DEFER_TASKRUN, COOP_TASKRUN
+//  - Multishot accept + multishot recv with provided buffers
+//  - Zero allocation in hot path
+//  - Zero context switches in steady state
 
+#ifndef NOLIBC
 #define _GNU_SOURCE
-
 #include <sched.h>
-
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#endif
 
 #include "core.h"
 #include "event.h"
@@ -43,7 +41,7 @@ enum {
     MAX_CONNECTIONS = 65536,
 };
 
-/* Compile-time validation */
+// Compile-time validation
 _Static_assert((NUM_BUFFERS & (NUM_BUFFERS - 1)) == 0, "NUM_BUFFERS must be power of 2");
 _Static_assert(NUM_BUFFERS <= 32768, "NUM_BUFFERS max is 32768");
 _Static_assert(BUFFER_SIZE >= 64, "BUFFER_SIZE too small");
@@ -63,17 +61,15 @@ static const char HTTP_200_RESPONSE[] =
 
 #define HTTP_200_LEN (sizeof(HTTP_200_RESPONSE) - 1)
 
-/* Context encoding - pack into 64-bit user_data
-   Layout: [fd:32][op:8][buf_idx:16][unused:8] */
+// Context encoding - pack into 64-bit user_data
+// Layout: [fd:32][op:8][buf_idx:16][unused:8]
 enum op_type {
     OP_ACCEPT     = 0,
     OP_RECV       = 1,
     OP_SEND       = 2,
     OP_CLOSE      = 3,
     OP_SETSOCKOPT = 4,
-#ifdef ENABLE_ZC
     OP_SEND_ZC    = 5,
-#endif
 };
 
 // Pre-shifted operation codes for faster encoding
@@ -82,9 +78,7 @@ enum op_type {
 #define OP_SEND_SHIFTED       ((u64)OP_SEND << 32)
 #define OP_CLOSE_SHIFTED      ((u64)OP_CLOSE << 32)
 #define OP_SETSOCKOPT_SHIFTED ((u64)OP_SETSOCKOPT << 32)
-#ifdef ENABLE_ZC
 #define OP_SEND_ZC_SHIFTED    ((u64)OP_SEND_ZC << 32)
-#endif
 
 // SQE templates — 64-byte aligned for SIMD copy, fd/user_data patched per-op
 #define CACHE_ALIGN __attribute__((aligned(64)))
@@ -103,12 +97,12 @@ static const struct io_uring_sqe SQE_TEMPLATE_RECV = {
     .opcode    = IORING_OP_RECV,
     .flags     = IOSQE_BUFFER_SELECT | IOSQE_FIXED_FILE,
     .ioprio    = IORING_RECV_MULTISHOT,
-    .len       = 0, /* MUST be 0 for multishot */
+    .len       = 0, // MUST be 0 for multishot
     .buf_group = BUFFER_GROUP_ID,
 };
 
 CACHE_ALIGN
-static struct io_uring_sqe SQE_TEMPLATE_SEND = { /* non-const: addr set at init */
+static struct io_uring_sqe SQE_TEMPLATE_SEND = { // non-const: addr set at init
     .opcode = IORING_OP_SEND,
     .flags  = IOSQE_FIXED_FILE,
     .len    = HTTP_200_LEN,
@@ -120,7 +114,6 @@ static const struct io_uring_sqe SQE_TEMPLATE_CLOSE = {
     .flags  = IOSQE_FIXED_FILE,
 };
 
-#ifdef ENABLE_ZC
 // ZC buffer group ID - distinct from recv buffer group
 #ifndef ZC_BUFFER_GROUP_ID
 #define ZC_BUFFER_GROUP_ID      1
@@ -132,7 +125,7 @@ static const struct io_uring_sqe SQE_TEMPLATE_CLOSE = {
 #define ZC_BUFFER_SIZE          4096
 #endif
 #ifndef ZC_BUFFER_SHIFT
-#define ZC_BUFFER_SHIFT         12  /* log2(ZC_BUFFER_SIZE) */
+#define ZC_BUFFER_SHIFT         12  // log2(ZC_BUFFER_SIZE)
 #endif
 
 _Static_assert((ZC_NUM_BUFFERS & (ZC_NUM_BUFFERS - 1)) == 0,
@@ -147,7 +140,6 @@ static const struct io_uring_sqe SQE_TEMPLATE_SEND_ZC = {
     .ioprio    = IORING_RECVSEND_BUNDLE,
     .buf_group = ZC_BUFFER_GROUP_ID,
 };
-#endif // ENABLE_ZC
 
 // Connection state - bit-packed for cache efficiency
 struct conn_state {
@@ -171,6 +163,13 @@ static inline struct conn_state *get_conn(int fd) {
 #define decode_op(ud) ((u8)((ud) >> 32))
 #define decode_buf_idx(ud) ((u16)((ud) >> 40))
 
+// Connection-lifecycle errors that don't warrant logging.
+// Peer reset / gone / fd already closed / op cancelled.
+static inline bool is_benign_err(int err) {
+    return err == -EPIPE || err == -ECONNRESET ||
+           err == -EBADF || err == -ECANCELED;
+}
+
 // SQE prep wrappers - macro dispatch to PREP_SQE (defined by sqe_*.h)
 #define prep_multishot_accept_direct(sqe, fd) \
     PREP_SQE(sqe, SQE_TEMPLATE_ACCEPT, fd, OP_ACCEPT_SHIFTED | 0xFFFFFFFF)
@@ -186,15 +185,13 @@ static inline struct conn_state *get_conn(int fd) {
 #define prep_close_direct(sqe, fd) \
     PREP_SQE(sqe, SQE_TEMPLATE_CLOSE, fd, OP_CLOSE_SHIFTED | (u32)(fd))
 
-#ifdef ENABLE_ZC
 #define prep_send_zc_direct(sqe, fd, buf_idx) \
     PREP_SQE(sqe, SQE_TEMPLATE_SEND_ZC, fd, OP_SEND_ZC_SHIFTED | (u32)(fd) | ((u64)(buf_idx) << 40))
-#endif
 
-/* SETSOCKOPT: SIMD zero + scalar patches. SQEs are 64-byte aligned. */
+// SETSOCKOPT: SIMD zero + scalar patches. SQEs are 64-byte aligned.
 static inline void prep_setsockopt_direct(struct io_uring_sqe *sqe, int idx,
                                            int level, int optname,
-                                           void *optval, int optlen) {
+                                           const void *optval, int optlen) {
     mem_zero_cacheline(sqe);
     sqe->opcode = IORING_OP_URING_CMD;
     sqe->flags = IOSQE_CQE_SKIP_SUCCESS | IOSQE_FIXED_FILE;
@@ -212,7 +209,11 @@ static inline void prep_setsockopt_direct(struct io_uring_sqe *sqe, int idx,
 static int create_listen_socket(u16 port, int cpu) {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (fd < 0) {
+#ifdef NOLIBC
+        LOG_FATAL("socket: error %d", fd);
+#else
         LOG_FATAL("socket: %s", strerror(errno));
+#endif
         return -1;
     }
 
@@ -227,14 +228,25 @@ static int create_listen_socket(u16 port, int cpu) {
         .sin_addr.s_addr = htonl(INADDR_ANY),
     };
 
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    int ret;
+    ret = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (ret < 0) {
+#ifdef NOLIBC
+        LOG_FATAL("bind: error %d", ret);
+#else
         LOG_FATAL("bind: %s", strerror(errno));
+#endif
         close(fd);
         return -1;
     }
 
-    if (listen(fd, LISTEN_BACKLOG) < 0) {
+    ret = listen(fd, LISTEN_BACKLOG);
+    if (ret < 0) {
+#ifdef NOLIBC
+        LOG_FATAL("listen: error %d", ret);
+#else
         LOG_FATAL("listen: %s", strerror(errno));
+#endif
         close(fd);
         return -1;
     }
@@ -259,10 +271,8 @@ struct server_ctx {
     struct uring ring;
     struct buf_ring_mgr br_mgr;
     struct buf_ring_group *recv_grp;    // Pointer into br_mgr.groups[0]
-#ifdef ENABLE_ZC
     struct buf_ring_group *zc_grp;      // Pointer into br_mgr.groups[1]
     bool zc_enabled;
-#endif
     // Legacy buf_ring for hot path caching (populated from recv_grp)
     struct buf_ring br;
     int listen_fd;
@@ -331,7 +341,7 @@ static inline bool queue_close(struct server_ctx *ctx, int fd) {
     struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
     if (unlikely(!sqe)) {
         LOG_ERROR("SQ full on close fd=%d", fd);
-        c->closing = 1;  /* Mark to prevent further ops */
+        c->closing = 1;  // Mark to prevent further ops
         return false;
     }
     prep_close_direct(sqe, fd);
@@ -350,7 +360,6 @@ static inline bool queue_setsockopt_nodelay(struct server_ctx *ctx, int fd) {
     return true;
 }
 
-#ifdef ENABLE_ZC
 static inline bool queue_send_zc(struct server_ctx *ctx, int fd,
                                   const void *data, u32 len) {
     struct conn_state *c = get_conn(fd);
@@ -365,7 +374,7 @@ static inline bool queue_send_zc(struct server_ctx *ctx, int fd,
 
     void *buf = BUF_RING_ADDR(&ctx->br_mgr, ctx->zc_grp, buf_idx);
     u32 copy_len = (len > ZC_BUFFER_SIZE) ? ZC_BUFFER_SIZE : len;
-    memcpy(buf, data, copy_len);
+    mem_copy_small(buf, data, copy_len);
 
     buf_ring_zc_push(&ctx->br_mgr, ctx->zc_grp, buf_idx, copy_len);
     buf_ring_mgr_sync(&ctx->br_mgr, ctx->zc_grp);
@@ -393,13 +402,12 @@ static inline void handle_send_zc(struct server_ctx *ctx,
     // Completion: send done, buffer still in-flight to NIC
     int res = cqe->res;
     if (unlikely(res < 0)) {
-        if (res != -EPIPE && res != -ECONNRESET && res != -EBADF && res != -ECANCELED)
+        if (!is_benign_err(res))
             LOG_ERROR("zc send error %d fd=%d", res, fd);
         queue_close(ctx, fd);
     }
     // Do NOT recycle - wait for NOTIF
 }
-#endif // ENABLE_ZC
 
 static inline void handle_setsockopt(struct server_ctx *ctx,
                                       struct io_uring_cqe *cqe, int fd) {
@@ -449,8 +457,7 @@ static inline void handle_recv(struct server_ctx *ctx, struct io_uring_cqe *cqe,
         c->recv_active = 0;
 
     if (unlikely(res <= 0)) {
-        if (res == 0 || res == -ECONNRESET || res == -EBADF ||
-            res == -EPIPE || res == -ECANCELED) {
+        if (res == 0 || is_benign_err(res)) {
             queue_close(ctx, fd);
         } else if (res == -ENOBUFS) {
             LOG_WARN("ENOBUFS fd=%d", fd);
@@ -537,7 +544,7 @@ static void event_loop(struct server_ctx *ctx) {
             prefetch_r(&cqes[(head + 1) & cq_mask]);
 
             u64 ud = cqe->user_data;
-            int32_t fd = decode_fd(ud);
+            i32 fd = decode_fd(ud);
             u8 op = decode_op(ud);
 
             switch (op) {
@@ -559,7 +566,7 @@ static void event_loop(struct server_ctx *ctx) {
                 br_tail++;
                 int res = cqe->res;
                 if (unlikely(res < 0)) {
-                    if (res != -EPIPE && res != -ECONNRESET && res != -EBADF && res != -ECANCELED)
+                    if (!is_benign_err(res))
                         LOG_ERROR("send error %d fd=%d", res, fd);
                     queue_close(ctx, fd);
                 } else if (unlikely((u32)res < HTTP_200_LEN)) {
@@ -574,11 +581,9 @@ static void event_loop(struct server_ctx *ctx) {
             case OP_SETSOCKOPT:
                 handle_setsockopt(ctx, cqe, fd);
                 break;
-#ifdef ENABLE_ZC
             case OP_SEND_ZC:
                 handle_send_zc(ctx, cqe, fd);
                 break;
-#endif
             default:
                 LOG_BUG("unknown op %u", op);
                 break;
@@ -615,12 +620,17 @@ int server_run(u16 port, int cpu) {
 
     mem_zero_aligned(g_conns, sizeof(g_conns));
 
+#ifdef NOLIBC
+    k_sigaction(SIGINT, signal_handler);
+    k_sigaction(SIGTERM, signal_handler);
+#else
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = signal_handler;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+#endif
 
     // Initialize SEND template with runtime address
     SQE_TEMPLATE_SEND.addr = (u64)HTTP_200_RESPONSE;
@@ -636,15 +646,11 @@ int server_run(u16 port, int cpu) {
     struct buf_ring_config configs[] = {
         { .num_buffers = NUM_BUFFERS, .buffer_size = BUFFER_SIZE,
           .buffer_shift = BUFFER_SHIFT, .bgid = BUFFER_GROUP_ID,
-#ifdef ENABLE_ZC
           .is_zc = 0
-#endif
         },
-#ifdef ENABLE_ZC
         { .num_buffers = ZC_NUM_BUFFERS, .buffer_size = ZC_BUFFER_SIZE,
           .buffer_shift = ZC_BUFFER_SHIFT, .bgid = ZC_BUFFER_GROUP_ID,
           .is_zc = 1 },
-#endif
     };
     ret = buf_ring_mgr_init(&ctx.ring, &ctx.br_mgr, configs,
                              sizeof(configs)/sizeof(configs[0]));
@@ -653,7 +659,6 @@ int server_run(u16 port, int cpu) {
         return 1;
     }
     ctx.recv_grp = &ctx.br_mgr.groups[0];
-#ifdef ENABLE_ZC
     ctx.zc_grp = &ctx.br_mgr.groups[1];
     // Probe for ZC support
     ret = buf_ring_zc_probe(&ctx.ring);
@@ -663,7 +668,6 @@ int server_run(u16 port, int cpu) {
     } else {
         LOG_INFO("Zerocopy send not available (ret=%d)", ret);
     }
-#endif
 
     // Setup legacy buf_ring struct for hot path (points into br_mgr)
     ctx.br.br = BUF_RING_PTR(&ctx.br_mgr, ctx.recv_grp);
@@ -687,7 +691,7 @@ int server_run(u16 port, int cpu) {
     }
     LOG_INFO("Fixed file table registered: %d slots", MAX_CONNECTIONS);
 
-    /* Install listen_fd as fixed file index 0 */
+    // Install listen_fd as fixed file index 0
     int install_fds[1] = { listen_fd };
     struct io_uring_files_update update = {
         .offset = 0,

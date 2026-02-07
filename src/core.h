@@ -1,14 +1,21 @@
 #pragma once
 
 #include <stdint.h>
-#include <stdio.h>
 
+#ifdef NOLIBC
+#include "nolibc.h"
+#else
+#include <stdio.h>
+#endif
+
+#ifndef NOLIBC
 typedef uint8_t  u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
 typedef int32_t  i32;
 typedef int64_t  i64;
+#endif
 
 #ifdef DEBUG
   #define LOG_INFO(fmt, ...)  fprintf(stderr, "[INFO] " fmt "\n", ##__VA_ARGS__)
@@ -24,9 +31,13 @@ typedef int64_t  i64;
   #define DEBUG_ONLY(x)       ((void)0)
 #endif
 
+#ifdef NOLIBC
+#define LOG_FATAL(fmt, ...) _fmt_write(2, "[FATAL] " fmt "\n", ##__VA_ARGS__)
+#else
 #define LOG_FATAL(fmt, ...) do { \
     fprintf(stderr, "[FATAL] " fmt "\n", ##__VA_ARGS__); \
 } while(0)
+#endif
 
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
