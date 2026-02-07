@@ -266,18 +266,25 @@ static int set_cpu_affinity(int cpu) {
     return sched_setaffinity(0, sizeof(cpuset), &cpuset);
 }
 
-// Server context
+// Server context - cache-line optimized layout
 struct server_ctx {
-    struct uring ring;
+    // === HOT: accessed every CQE iteration (first cache line) ===
+    struct buf_ring br;              // 28 bytes, buffer recycling
+    sig_atomic_t running;            // +28: Loop condition
+    int listen_fd;                   // +32: Moved here to eliminate padding hole
+    u8 _pad_hot[28];                 // +36: Pad to 64 bytes
+
+    // === WARM: accessed per batch ===
+    struct uring ring;               // SQ/CQ access
+
+    // === COLD: rarely accessed after init ===
     struct buf_ring_mgr br_mgr;
-    struct buf_ring_group *recv_grp;    // Pointer into br_mgr.groups[0]
-    struct buf_ring_group *zc_grp;      // Pointer into br_mgr.groups[1]
-    bool zc_enabled;
-    // Legacy buf_ring for hot path caching (populated from recv_grp)
-    struct buf_ring br;
-    int listen_fd;
-    sig_atomic_t running;  // Proper type for signal handlers
-};
+    struct buf_ring_group *recv_grp; // Pointer into br_mgr.groups[0]
+    struct buf_ring_group *zc_grp;   // Pointer into br_mgr.groups[1], NULL if ZC disabled
+} __attribute__((aligned(64)));
+
+// ZC enabled check: if zc_grp is non-NULL, ZC is enabled
+#define ctx_zc_enabled(ctx) ((ctx)->zc_grp != NULL)
 
 static struct server_ctx *g_ctx = NULL;
 
@@ -302,6 +309,8 @@ static inline bool queue_recv(struct server_ctx *ctx, int fd) {
     struct conn_state *c = get_conn(fd);
     if (unlikely(!c) || c->closing)
         return false;
+    if (c->recv_active)
+        return true;  // Already have active multishot recv
 
     struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
     if (unlikely(!sqe)) {
@@ -598,6 +607,13 @@ static void event_loop(struct server_ctx *ctx) {
         if (br_tail != br_tail_start)
             buf_ring_sync(&ctx->br);
         smp_store_release(cq->khead, head);
+
+        // Check for CQ overflow - silent data loss is unacceptable
+        u32 overflow = smp_load_acquire(cq->koverflow);
+        if (unlikely(overflow)) {
+            LOG_FATAL("CQ overflow: %u completions lost", overflow);
+            ctx->running = 0;
+        }
     }
 
     LOG_INFO("Event loop exiting");
@@ -646,11 +662,11 @@ int server_run(u16 port, int cpu) {
     struct buf_ring_config configs[] = {
         { .num_buffers = NUM_BUFFERS, .buffer_size = BUFFER_SIZE,
           .buffer_shift = BUFFER_SHIFT, .bgid = BUFFER_GROUP_ID,
-          .is_zc = 0
+          .flags = 0
         },
         { .num_buffers = ZC_NUM_BUFFERS, .buffer_size = ZC_BUFFER_SIZE,
           .buffer_shift = ZC_BUFFER_SHIFT, .bgid = ZC_BUFFER_GROUP_ID,
-          .is_zc = 1 },
+          .flags = BRC_FLAG_ZC },
     };
     ret = buf_ring_mgr_init(&ctx.ring, &ctx.br_mgr, configs,
                              sizeof(configs)/sizeof(configs[0]));
@@ -659,13 +675,13 @@ int server_run(u16 port, int cpu) {
         return 1;
     }
     ctx.recv_grp = &ctx.br_mgr.groups[0];
-    ctx.zc_grp = &ctx.br_mgr.groups[1];
-    // Probe for ZC support
+    // Probe for ZC support - set zc_grp to NULL if not available
     ret = buf_ring_zc_probe(&ctx.ring);
-    ctx.zc_enabled = (ret == 0);
-    if (ctx.zc_enabled) {
+    if (ret == 0) {
+        ctx.zc_grp = &ctx.br_mgr.groups[1];
         LOG_INFO("Zerocopy send enabled");
     } else {
+        ctx.zc_grp = NULL;
         LOG_INFO("Zerocopy send not available (ret=%d)", ret);
     }
 

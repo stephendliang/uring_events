@@ -84,11 +84,17 @@ static inline void mem_zero_cacheline(void *dst) {
 static inline void mem_iota_u32(u32 *dst, u32 n) {
     __m512i base = _mm512_setr_epi32(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
     __m512i step = _mm512_set1_epi32(16);
-    u32 *end = dst + n;
+    u32 *end = dst + (n & ~15U);  // Round down to multiple of 16
+    u32 val = 0;
     while (dst < end) {
         _mm512_store_si512((__m512i *)dst, base);
         base = _mm512_add_epi32(base, step);
         dst += 16;
+        val += 16;
+    }
+    // Scalar remainder
+    while (val < n) {
+        *dst++ = val++;
     }
 }
 
@@ -176,11 +182,17 @@ static inline void mem_zero_cacheline(void *dst) {
 static inline void mem_iota_u32(u32 *dst, u32 n) {
     __m256i base = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
     __m256i step = _mm256_set1_epi32(8);
-    u32 *end = dst + n;
+    u32 *end = dst + (n & ~7U);  // Round down to multiple of 8
+    u32 val = 0;
     while (dst < end) {
         _mm256_store_si256((__m256i *)dst, base);
         base = _mm256_add_epi32(base, step);
         dst += 8;
+        val += 8;
+    }
+    // Scalar remainder
+    while (val < n) {
+        *dst++ = val++;
     }
 }
 

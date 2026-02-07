@@ -5,6 +5,7 @@
 
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stddef.h>  // for offsetof
 
 #ifndef NOLIBC
 #include <string.h>
@@ -51,7 +52,7 @@
 
 // Buffer ring configuration limits
 enum {
-    BUF_RING_MAX_GROUPS  = 4,
+    BUF_RING_MAX_GROUPS  = 2,   // recv + ZC only
     BUF_RING_MAX_BUFFERS = 8192,
 };
 
@@ -62,45 +63,45 @@ enum {
 
 // Ring structures - cache-line optimized layout
 struct uring_sq {
-    // Kernel-shared pointers - read frequently
-    u32 *khead;            // Consumer head (kernel updates)
-    u32 *ktail;            // Producer tail (we update)
-    u32 *kring_mask;       // Cached on init
-    u32 *kring_entries;    // Cached on init
-    u32 *array;            // SQE index array
-    struct io_uring_sqe *sqes;  // SQE array
+    // === First cache line (64 bytes): Hot path ===
+    u32 *khead;                     // +0:  Consumer head (kernel updates)
+    u32 *ktail;                     // +8:  Producer tail (we update)
+    struct io_uring_sqe *sqes;      // +16: SQE array
+    u32 *array;                     // +24: SQE index array
+    u32 ring_mask;                  // +32: Cached from *kring_mask
+    u32 ring_entries;               // +36: Cached from *kring_entries
+    u32 sqe_head;                   // +40: Our head for tracking submissions
+    u32 sqe_tail;                   // +44: Our tail for tracking submissions
+    u32 cached_khead;               // +48: Cached kernel head - avoid repeated loads
+    u32 _pad0;                      // +52: Explicit padding
+    u32 *kflags;                    // +56: Moved to first cache line
 
-    // Local state - not shared with kernel
-    u32 ring_mask;         // Cached from *kring_mask
-    u32 ring_entries;      // Cached from *kring_entries
-    u32 sqe_head;          // Our head for tracking submissions
-    u32 sqe_tail;          // Our tail for tracking submissions
-    u32 cached_khead;      // Cached kernel head - avoid repeated loads
-
-    // Init-time only
-    u32 *kflags;
-    u32 *kdropped;
-    size_t ring_sz;
-    u8 *ring_ptr;
+    // === Second cache line: Cold ===
+    u32 *kdropped;                  // +64
+    u32 *kring_mask;                // +72
+    u32 *kring_entries;             // +80
+    size_t ring_sz;                 // +88
+    u8 *ring_ptr;                   // +96
 };
+// Total: 104 bytes (hole explicit, kflags moved to first cache line)
 
 struct uring_cq {
-    // Kernel-shared pointers
-    u32 *khead;            // Consumer head (we update)
-    u32 *ktail;            // Producer tail (kernel updates)
-    struct io_uring_cqe *cqes;  // CQE array
+    // === Hot path (first 32 bytes) ===
+    u32 *khead;                     // +0:  Updated every CQ drain
+    u32 *ktail;                     // +8:  Loaded every loop
+    struct io_uring_cqe *cqes;      // +16: Indexed every CQE
+    u32 ring_mask;                  // +24: Used every CQE index
+    u32 _pad0;                      // +28: Explicit padding
 
-    // Cached values
-    u32 ring_mask;
-
-    // Init-time only
-    u32 *kring_mask;
-    u32 *kring_entries;
-    u32 *kflags;
-    u32 *koverflow;
-    size_t ring_sz;
-    u8 *ring_ptr;
+    // === Cold init-time (remaining 48 bytes) ===
+    u32 *kring_mask;                // +32
+    u32 *kring_entries;             // +40
+    u32 *kflags;                    // +48
+    u32 *koverflow;                 // +56
+    size_t ring_sz;                 // +64
+    u8 *ring_ptr;                   // +72
 };
+// Total: 80 bytes (hole now explicit padding)
 
 struct uring {
     struct uring_sq sq;
@@ -117,31 +118,57 @@ struct buf_ring_config {
     u16 bgid;              // Buffer group ID for kernel registration
     u32 buffer_size;       // Size of each buffer
     u32 buffer_shift;      // log2(buffer_size) for fast address calc
-    u8 is_zc;              // Zerocopy mode (bitmap tracking)
+    u32 flags;             // Bit 0: is_zc, bits 1-31: reserved
 };
 
+// buf_ring_config flag accessors
+#define BRC_FLAG_ZC  (1U << 0)
+#define brc_is_zc(c) ((c)->flags & BRC_FLAG_ZC)
+
 // Per-group descriptor - offsets into shared allocation
+// Layout optimized for cache behavior: hot fields first, cold fields last
+// Aggressively shrunk: bgid derived from index, num_buffers from mask+1, is_zc from bitmap
 struct buf_ring_group {
-    u16 tail;              // Local tail for ring operations
-    u16 mask;              // num_buffers - 1
-    u16 bgid;              // Buffer group ID
-    u16 num_buffers;       // Number of buffers in this group
-    u32 buffer_size;       // Size of each buffer
-    u32 buffer_shift;      // log2(buffer_size)
-    u32 ring_offset;       // Offset into shared mmap for ring header
-    u32 data_offset;       // Offset into shared mmap for buffer data
-    u8 is_zc;              // Zerocopy mode flag
-    u16 free_count;        // Number of free buffers (ZC only)
-    u64 free_bitmap[BUF_RING_MAX_BUFFERS / 64];  // 1=free, 0=in-flight
+    // === Hot path (first 8 bytes) ===
+    u16 tail;              // +0:  Updated every recycle
+    u16 mask;              // +2:  Read every recycle (num_buffers = mask + 1)
+    u16 free_count;        // +4:  ZC: updated per alloc/free
+    u16 free_summary;      // +6:  ZC: bitmap summary
+
+    // === Address calculation (next 8 bytes) ===
+    u32 buffer_shift;      // +8:  HOT: used in BUF_RING_ADDR
+    u32 buffer_size;       // +12: WARM: occasional reads
+
+    // === Cold offsets (next 8 bytes) ===
+    u32 ring_offset;       // +16: Init-time only
+    u32 data_offset;       // +20: Init-time only
+
+    // === Pointer (final 8 bytes) ===
+    u64 *free_bitmap;      // +24: ZC only (NULL = not ZC)
 };
+// Total: 32 bytes (fits in half cache line)
+// Derived fields:
+//   bgid = array index in buf_ring_mgr.groups[]
+//   num_buffers = mask + 1
+//   is_zc = (free_bitmap != NULL)
+
+// buf_ring_group derived field accessors
+#define BRG_IS_ZC(g)         ((g)->free_bitmap != NULL)
+#define BRG_NUM_BUFFERS(g)   ((u16)((g)->mask + 1))
 
 // Unified buffer ring manager - single mmap for all groups
 struct buf_ring_mgr {
-    void *base;                 // Single mmap base address
-    size_t total_size;          // Total mmap size
-    struct buf_ring_group groups[BUF_RING_MAX_GROUPS];
-    u8 num_groups;         // Currently registered groups
+    void *base;                             // +0:  Single mmap base address
+    size_t total_size;                      // +8:  Total mmap size
+    struct buf_ring_group groups[BUF_RING_MAX_GROUPS]; // +16: 64 bytes (2 groups @ 32 each)
+    struct {
+        u8 num_groups : 2;                  // Max 2 groups
+        u8 initialized : 1;                 // Manager fully initialized
+        u8 _reserved : 5;                   // Future flags
+    } meta;                                 // +80: 1 byte
+    u8 _pad[7];                             // +81: Padding to 88 bytes
 };
+// Total: 88 bytes (shrunk from 104)
 
 // Legacy single-group struct for backwards compatibility
 struct buf_ring {
@@ -152,6 +179,26 @@ struct buf_ring {
     u32 buffer_size;
     u32 buffer_shift;
 };
+
+// Layout verification - prevent silent ABI breaks
+_Static_assert(sizeof(struct buf_ring_config) == 16,
+               "buf_ring_config layout changed");
+_Static_assert(sizeof(struct buf_ring) == 32,
+               "buf_ring layout changed");
+_Static_assert(sizeof(struct buf_ring_group) == 32,
+               "buf_ring_group layout changed");
+_Static_assert(sizeof(struct uring_cq) == 80,
+               "uring_cq layout changed");
+_Static_assert(sizeof(struct uring_sq) == 104,
+               "uring_sq layout changed");
+_Static_assert(sizeof(struct buf_ring_mgr) == 88,
+               "buf_ring_mgr layout changed");
+
+// Hot field offset verification
+_Static_assert(offsetof(struct buf_ring_group, tail) == 0,
+               "buf_ring_group.tail must be at offset 0");
+_Static_assert(offsetof(struct uring_cq, ring_mask) < 32,
+               "uring_cq.ring_mask must be in first 32 bytes");
 
 // Buffer ring accessor macros - fast, no function call overhead
 #define BUF_RING_PTR(mgr, grp) \
@@ -451,6 +498,7 @@ static int buf_ring_mgr_init(struct uring *ring, struct buf_ring_mgr *mgr,
 
     // Calculate total size needed for all groups
     size_t total = 0;
+    size_t bitmap_sizes[BUF_RING_MAX_GROUPS] = {0};
     for (int i = 0; i < num_configs; i++) {
         if (configs[i].num_buffers > BUF_RING_MAX_BUFFERS)
             return -EINVAL;
@@ -458,6 +506,12 @@ static int buf_ring_mgr_init(struct uring *ring, struct buf_ring_mgr *mgr,
             return -EINVAL;  // Must be power of 2
         total += sizeof(struct io_uring_buf) * configs[i].num_buffers;
         total += (size_t)configs[i].buffer_size * configs[i].num_buffers;
+        // Calculate bitmap size for ZC groups (round up to 64-byte alignment)
+        if (brc_is_zc(&configs[i])) {
+            size_t bitmap_bytes = ((configs[i].num_buffers + 63) / 64) * sizeof(u64);
+            bitmap_sizes[i] = (bitmap_bytes + 63) & ~(size_t)63;
+            total += bitmap_sizes[i];
+        }
     }
 
     // Attempt mmap with huge pages
@@ -478,42 +532,55 @@ static int buf_ring_mgr_init(struct uring *ring, struct buf_ring_mgr *mgr,
     size_t offset = 0;
     for (int i = 0; i < num_configs; i++) {
         struct buf_ring_group *g = &mgr->groups[i];
-        size_t ring_size = sizeof(struct io_uring_buf) * configs[i].num_buffers;
-        size_t data_size = (size_t)configs[i].buffer_size * configs[i].num_buffers;
+        u16 num_buffers = configs[i].num_buffers;
+        u16 bgid = configs[i].bgid;
+        size_t ring_size = sizeof(struct io_uring_buf) * num_buffers;
+        size_t data_size = (size_t)configs[i].buffer_size * num_buffers;
+
+        // Invariant: bgid must equal array index for destroy to work
+        // (bgid is derived from index, not stored)
+        if (bgid != (u16)i)
+            return -EINVAL;
 
         g->ring_offset = (u32)offset;
         g->data_offset = (u32)(offset + ring_size);
-        g->num_buffers = configs[i].num_buffers;
         g->buffer_size = configs[i].buffer_size;
         g->buffer_shift = configs[i].buffer_shift;
-        g->bgid = configs[i].bgid;
-        g->mask = configs[i].num_buffers - 1;
+        g->mask = num_buffers - 1;  // num_buffers derived as mask + 1
         g->tail = 0;
 
-        // Register this group with kernel
+        // Register this group with kernel (bgid = array index)
         int ret = buf_ring_register(ring, (char*)ptr + g->ring_offset,
-                                     g->num_buffers, g->bgid);
+                                     num_buffers, bgid);
         if (ret < 0) {
-            // Cleanup already registered groups 
+            // Cleanup already registered groups (bgid = index)
             for (int j = 0; j < i; j++)
-                buf_ring_unregister(ring, mgr->groups[j].bgid);
+                buf_ring_unregister(ring, (u16)j);
             munmap(ptr, total);
             mgr->base = NULL;
             return ret;
         }
 
-        if (configs[i].is_zc) {
-            g->is_zc = 1;
-            g->free_count = g->num_buffers;
-            __builtin_memset(g->free_bitmap, 0xFF, sizeof(g->free_bitmap));
+        if (brc_is_zc(&configs[i])) {
+            // is_zc derived from free_bitmap != NULL
+            g->free_count = num_buffers;
+            // Bitmap is allocated after data region
+            g->free_bitmap = (u64 *)((char *)ptr + offset + ring_size + data_size);
+            size_t bitmap_words = (num_buffers + 63) / 64;
+            for (size_t w = 0; w < bitmap_words; w++)
+                g->free_bitmap[w] = ~0ULL;
             // Clear trailing bits if not power-of-64 aligned
-            u16 trailing = g->num_buffers & 63;
+            u16 trailing = num_buffers & 63;
             if (trailing)
-                g->free_bitmap[(g->num_buffers - 1) >> 6] &= (1ULL << trailing) - 1;
+                g->free_bitmap[(num_buffers - 1) >> 6] &= (1ULL << trailing) - 1;
+            // Initialize free_summary: all words with free buffers
+            g->free_summary = (u16)((1U << bitmap_words) - 1);
         } else {
+            g->free_bitmap = NULL;  // is_zc = false (derived from this)
+            g->free_summary = 0;
             // Init buffers for recv mode (pre-fill ring)
             struct io_uring_buf_ring *br = BUF_RING_PTR(mgr, g);
-            for (u32 j = 0; j < g->num_buffers; j++) {
+            for (u32 j = 0; j < num_buffers; j++) {
                 struct io_uring_buf *buf = &br->bufs[g->tail & g->mask];
                 buf->addr = (u64)BUF_RING_ADDR(mgr, g, j);
                 buf->len = g->buffer_size;
@@ -523,24 +590,27 @@ static int buf_ring_mgr_init(struct uring *ring, struct buf_ring_mgr *mgr,
             smp_store_release(&br->tail, g->tail);
         }
 
-        offset += ring_size + data_size;
+        offset += ring_size + data_size + bitmap_sizes[i];
     }
 
-    mgr->num_groups = num_configs;
+    mgr->meta.num_groups = num_configs;
+    mgr->meta.initialized = 1;
     return 0;
 }
 
 // Cleanup - single munmap for all groups
 static inline void buf_ring_mgr_destroy(struct uring *ring,
                                          struct buf_ring_mgr *mgr) {
-    for (int i = 0; i < mgr->num_groups; i++) {
-        buf_ring_unregister(ring, mgr->groups[i].bgid);
+    // bgid = array index (invariant enforced in init)
+    for (int i = 0; i < mgr->meta.num_groups; i++) {
+        buf_ring_unregister(ring, (u16)i);
     }
     if (mgr->base) {
         munmap(mgr->base, mgr->total_size);
         mgr->base = NULL;
     }
-    mgr->num_groups = 0;
+    mgr->meta.num_groups = 0;
+    mgr->meta.initialized = 0;
 }
 
 // Sync buffer ring tail to kernel
@@ -552,26 +622,43 @@ static inline void buf_ring_mgr_sync(struct buf_ring_mgr *mgr,
 
 // Zerocopy buffer operations
 
-// Bitmap operations
-static inline void zc_bitmap_set(u64 *bitmap, u16 idx) {
-    bitmap[idx >> 6] |= (1ULL << (idx & 63));
-}
-static inline void zc_bitmap_clear(u64 *bitmap, u16 idx) {
-    bitmap[idx >> 6] &= ~(1ULL << (idx & 63));
-}
-static inline int zc_bitmap_test(const u64 *bitmap, u16 idx) {
-    return (bitmap[idx >> 6] >> (idx & 63)) & 1;
+// Bitmap operations with hierarchical summary for O(1) lookup
+
+// Set bit (mark buffer as free) - updates summary if word becomes non-zero
+static inline void zc_bitmap_set(struct buf_ring_group *g, u16 idx) {
+    u16 word = idx >> 6;
+    u64 old = g->free_bitmap[word];
+    g->free_bitmap[word] = old | (1ULL << (idx & 63));
+    // Update summary: if word was zero, now has free slots
+    if (old == 0)
+        g->free_summary |= (1U << word);
 }
 
-static inline int zc_bitmap_ffs(const u64 *bitmap, u16 count) {
-    u16 words = (count + 63) / 64;
-    for (u16 i = 0; i < words; i++) {
-        if (bitmap[i]) {
-            u16 idx = (i << 6) + __builtin_ctzll(bitmap[i]);
-            return (idx < count) ? idx : -1;
-        }
-    }
-    return -1;
+// Clear bit (mark buffer as in-flight) - updates summary if word becomes zero
+static inline void zc_bitmap_clear(struct buf_ring_group *g, u16 idx) {
+    u16 word = idx >> 6;
+    u64 new_val = g->free_bitmap[word] & ~(1ULL << (idx & 63));
+    g->free_bitmap[word] = new_val;
+    // Update summary: if word is now zero, no free slots in this word
+    if (new_val == 0)
+        g->free_summary &= ~(1U << word);
+}
+
+static inline int zc_bitmap_test(const struct buf_ring_group *g, u16 idx) {
+    return (g->free_bitmap[idx >> 6] >> (idx & 63)) & 1;
+}
+
+// O(1) find-first-set using hierarchical summary
+static inline int zc_bitmap_ffs(const struct buf_ring_group *g) {
+    if (g->free_summary == 0)
+        return -1;
+    // Find first word with free slots
+    u16 word = (u16)__builtin_ctz(g->free_summary);
+    u64 bits = g->free_bitmap[word];
+    if (bits == 0)
+        return -1;  // Should not happen if summary is correct
+    u16 idx = (word << 6) + (u16)__builtin_ctzll(bits);
+    return (idx < BRG_NUM_BUFFERS(g)) ? idx : -1;
 }
 
 // Allocate a buffer from ZC group (bitmap-based)
@@ -579,11 +666,11 @@ static inline u16 buf_ring_zc_alloc(struct buf_ring_group *g) {
     if (unlikely(g->free_count == 0))
         return UINT16_MAX;
 
-    int idx = zc_bitmap_ffs(g->free_bitmap, g->num_buffers);
+    int idx = zc_bitmap_ffs(g);
     if (unlikely(idx < 0))
         return UINT16_MAX;
 
-    zc_bitmap_clear(g->free_bitmap, (u16)idx);
+    zc_bitmap_clear(g, (u16)idx);
     g->free_count--;
     return (u16)idx;
 }
@@ -591,11 +678,11 @@ static inline u16 buf_ring_zc_alloc(struct buf_ring_group *g) {
 // Recycle a ZC buffer (called on notification CQE)
 static inline void buf_ring_zc_recycle(struct buf_ring_group *g, u16 bid) {
     DEBUG_ONLY(if (bid > g->mask) { LOG_BUG("zc: invalid bid %u", bid); return; });
-    DEBUG_ONLY(if (zc_bitmap_test(g->free_bitmap, bid)) {
+    DEBUG_ONLY(if (zc_bitmap_test(g, bid)) {
         LOG_BUG("zc: double free bid %u", bid); return;
     });
 
-    zc_bitmap_set(g->free_bitmap, bid);
+    zc_bitmap_set(g, bid);
     g->free_count++;
 }
 

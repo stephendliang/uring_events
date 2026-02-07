@@ -297,14 +297,17 @@ static inline void _fmt_write(int fd, const char *fmt, ...) {
 // The pragma prevents GCC from converting the loop back into a
 // memset/memcpy call (infinite recursion).
 
+// Aliasing-safe u64 for memset/memcpy - avoids strict aliasing UB
+typedef u64 __attribute__((may_alias)) u64_alias;
+
 #pragma GCC push_options
 #pragma GCC optimize("no-tree-loop-distribute-patterns")
 
 __attribute__((noinline, used, externally_visible))
 void *memset(void *s, int c, size_t n) {
     u8 *p = (u8 *)s;
-    u64 fill = (u8)c * 0x0101010101010101ULL;
-    while (n >= 8) { *(u64 *)p = fill; p += 8; n -= 8; }
+    u64_alias fill = (u8)c * 0x0101010101010101ULL;
+    while (n >= 8) { *(u64_alias *)p = fill; p += 8; n -= 8; }
     while (n--) *p++ = (u8)c;
     return s;
 }
@@ -313,7 +316,7 @@ __attribute__((noinline, used, externally_visible))
 void *memcpy(void *dst, const void *src, size_t n) {
     u8 *d = (u8 *)dst;
     const u8 *s = (const u8 *)src;
-    while (n >= 8) { *(u64 *)d = *(const u64 *)s; d += 8; s += 8; n -= 8; }
+    while (n >= 8) { *(u64_alias *)d = *(const u64_alias *)s; d += 8; s += 8; n -= 8; }
     while (n--) *d++ = *s++;
     return dst;
 }
