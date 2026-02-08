@@ -1,6 +1,6 @@
 CC       ?= gcc
 BINARY   := event
-SRC      := src/main.c src/event.c
+SRC      := src/main.c src/event.c src/uring.c
 HEADERS  := $(wildcard src/*.h)
 
 CFLAGS_COMMON := -std=gnu11 -Wall -Wextra -Werror

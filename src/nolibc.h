@@ -184,13 +184,6 @@ static inline _Noreturn void sys_exit_group(int status) {
 #define listen(fd,bl)                      sys_listen(fd,bl)
 #define sched_setaffinity(pid,len,mask)    sys_sched_setaffinity(pid,len,mask)
 
-// mmap error helpers
-
-// Raw syscall returns negative errno in the pointer value (e.g., -12 for ENOMEM).
-// Values from -1 to -4095 indicate errors (kernel guarantee).
-#define IS_MMAP_ERR(p) ((unsigned long)(p) >= (unsigned long)-4095UL)
-#define MMAP_ERR(p)    ((int)(long)(p))
-
 // Signal helpers
 
 // sa_restorer trampoline — kernel requires SA_RESTORER on x86-64

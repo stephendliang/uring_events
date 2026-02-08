@@ -218,9 +218,12 @@ static int create_listen_socket(u16 port, int cpu) {
     }
 
     int opt = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
-    setsockopt(fd, SOL_SOCKET, SO_INCOMING_CPU, &cpu, sizeof(cpu));
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0)
+        LOG_WARN("setsockopt(SO_REUSEADDR) failed");
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0)
+        LOG_WARN("setsockopt(SO_REUSEPORT) failed");
+    if (setsockopt(fd, SOL_SOCKET, SO_INCOMING_CPU, &cpu, sizeof(cpu)) < 0)
+        LOG_WARN("setsockopt(SO_INCOMING_CPU) failed");
 
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
@@ -637,8 +640,10 @@ int server_run(u16 port, int cpu) {
     mem_zero_aligned(g_conns, sizeof(g_conns));
 
 #ifdef NOLIBC
-    k_sigaction(SIGINT, signal_handler);
-    k_sigaction(SIGTERM, signal_handler);
+    if (k_sigaction(SIGINT, signal_handler) < 0)
+        LOG_WARN("sigaction(SIGINT) failed");
+    if (k_sigaction(SIGTERM, signal_handler) < 0)
+        LOG_WARN("sigaction(SIGTERM) failed");
 #else
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));

@@ -22,6 +22,7 @@ PORT="${1:-8080}"
 CPU="${2:-0}"
 SOURCE="src/event.c"
 SOURCE_MAIN="src/main.c"
+SOURCE_URING="src/uring.c"
 HEADER="src/uring.h"
 CORE_HEADER="src/core.h"
 BINARY="event"
@@ -98,7 +99,7 @@ validate_source() {
     fi
 
     # CHECK 2: No liburing includes (we don't use liburing)
-    if grep -n '#include.*<liburing' "$SOURCE" "$HEADER" 2>/dev/null; then
+    if grep -n '#include.*<liburing' "$SOURCE" "$SOURCE_URING" "$HEADER" 2>/dev/null; then
         log_error "CRITICAL: Found liburing include!"
         log_error "         This server uses raw io_uring syscalls, not liburing"
         errors=$((errors + 1))
@@ -115,7 +116,7 @@ validate_source() {
     )
 
     for flag in "${required_flags[@]}"; do
-        if grep -q "$flag" "$SOURCE" "$HEADER" 2>/dev/null; then
+        if grep -q "$flag" "$SOURCE" "$SOURCE_URING" "$HEADER" 2>/dev/null; then
             log_ok "Found $flag"
         else
             log_error "MISSING: $flag not found in source or header!"
@@ -156,7 +157,7 @@ validate_source() {
     fi
 
     # CHECK 8: No SQPOLL (explicitly avoided per CLAUDE.md)
-    if grep -q "IORING_SETUP_SQPOLL" "$SOURCE" "$HEADER" 2>/dev/null; then
+    if grep -q "IORING_SETUP_SQPOLL" "$SOURCE" "$SOURCE_URING" "$HEADER" 2>/dev/null; then
         log_warn "SQPOLL found - per CLAUDE.md this should be avoided"
         log_warn "         'Kernel polling threads burn CPU and fight for cache'"
     else
@@ -172,7 +173,7 @@ validate_source() {
     fi
 
     # CHECK 10: Memory barriers present (for correct ring operation)
-    if grep -q "ATOMIC_ACQUIRE\|ATOMIC_RELEASE\|smp_load_acquire\|smp_store_release" "$SOURCE" "$HEADER" 2>/dev/null; then
+    if grep -q "ATOMIC_ACQUIRE\|ATOMIC_RELEASE\|smp_load_acquire\|smp_store_release" "$SOURCE" "$SOURCE_URING" "$HEADER" 2>/dev/null; then
         log_ok "Memory barriers present"
     else
         log_warn "No memory barriers found - may cause race conditions"
