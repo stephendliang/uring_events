@@ -104,11 +104,7 @@ int uring_init(struct uring *ring, u32 sq_entries, u32 cq_entries) {
     p.cq_entries = cq_entries;
 
     ring->ring_fd = io_uring_setup(sq_entries, &p);
-#ifdef NOLIBC
     if (ring->ring_fd == -EINVAL) {
-#else
-    if (ring->ring_fd < 0 && errno == EINVAL) {
-#endif
         // Kernel may not support NO_SQARRAY — retry without.
         // Reset p fully since kernel may have partially modified it.
         p = (struct io_uring_params){0};
@@ -117,11 +113,7 @@ int uring_init(struct uring *ring, u32 sq_entries, u32 cq_entries) {
         ring->ring_fd = io_uring_setup(sq_entries, &p);
     }
     if (unlikely(ring->ring_fd < 0))
-#ifdef NOLIBC
         return ring->ring_fd;
-#else
-        return -errno;
-#endif
 
     ring->features = p.features;
     ring->flags = p.flags;  // Store what kernel accepted

@@ -13,6 +13,7 @@
 
 #if defined(__AVX512F__)
 // AVX-512: one 64-byte store per cache line
+#define _MM_MALLOC_H_INCLUDED
 #include <immintrin.h>
 
 #pragma GCC push_options
@@ -102,6 +103,7 @@ static inline void mem_iota_u32(u32 *dst, u32 n) {
 
 #elif defined(__AVX2__)
 // AVX2: two 32-byte stores per cache line
+#define _MM_MALLOC_H_INCLUDED
 #include <immintrin.h>
 
 #pragma GCC push_options

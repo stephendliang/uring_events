@@ -7,15 +7,6 @@
 #include <stdbool.h>
 #include <stddef.h>  // for offsetof
 
-#ifndef NOLIBC
-#include <string.h>
-#include <errno.h>
-#include <signal.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <sys/syscall.h>
-#endif
-
 #include <linux/io_uring.h>
 #include <linux/time_types.h>
 
@@ -212,27 +203,14 @@ _Static_assert(offsetof(struct uring_cq, ring_mask) < 32,
     (BUF_RING_DATA(mgr, grp) + ((u32)(idx) << (grp)->buffer_shift))
 
 // syscall wrappers; no liburing
-#ifdef NOLIBC
 #define io_uring_setup(entries, params) \
     sys_io_uring_setup((entries), (params))
 #define io_uring_register(fd, opcode, arg, nr_args) \
     sys_io_uring_register((fd), (opcode), (arg), (nr_args))
-#else
-#define io_uring_setup(entries, params) \
-    (int)syscall(__NR_io_uring_setup, (entries), (params))
-#define io_uring_register(fd, opcode, arg, nr_args) \
-    (int)syscall(__NR_io_uring_register, (fd), (opcode), (arg), (nr_args))
-#endif
 
-// mmap error checking — raw syscalls return negative errno in pointer,
-// glibc returns MAP_FAILED and sets errno. These macros unify both.
-#ifdef NOLIBC
+// mmap error checking — raw syscalls return negative errno in pointer
 #define IS_MMAP_ERR(p) ((unsigned long)(p) >= (unsigned long)-4095UL)
 #define MMAP_ERR(p)    ((int)(long)(p))
-#else
-#define IS_MMAP_ERR(p) ((p) == MAP_FAILED)
-#define MMAP_ERR(p)    (-errno)
-#endif
 
 // Cold-path functions — implementations in uring.c
 int uring_init(struct uring *ring, u32 sq_entries, u32 cq_entries);
@@ -292,14 +270,8 @@ static inline int uring_submit_and_wait(struct uring *ring,
         .ts = (u64)ts,
     };
 
-#ifdef NOLIBC
     long ret = sys_io_uring_enter(ring->ring_fd, to_submit, wait_nr,
                                    flags, &arg, sizeof(arg));
-#else
-    long ret = syscall(__NR_io_uring_enter, ring->ring_fd, to_submit, wait_nr,
-                       flags, &arg, sizeof(arg));
-    if (ret < 0) ret = -errno;
-#endif
 
     if (unlikely(ret < 0)) {
         if (ret != -ETIME && ret != -EINTR)

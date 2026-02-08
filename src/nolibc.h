@@ -1,6 +1,6 @@
 #pragma once
 // nolibc.h — freestanding replacement for glibc (x86-64 Linux only).
-// Included only when -DNOLIBC is set (release builds).
+// Always included — freestanding replacement for glibc (x86-64 Linux only).
 // Provides: kernel constants, raw syscalls, minimal formatting, _start.
 
 // Compiler-provided (freestanding)

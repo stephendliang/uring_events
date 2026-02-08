@@ -1,9 +1,4 @@
-#ifdef NOLIBC
 #define NOLIBC_MAIN
-#else
-#define _GNU_SOURCE
-#include <sched.h>
-#endif
 
 #include "core.h"
 #include "event.h"

@@ -1,4 +1,5 @@
 #pragma once
+#define _MM_MALLOC_H_INCLUDED
 #include <immintrin.h>
 
 #define PREP_SQE(sqe, tmpl, fd_val, ud_val) do {                       \

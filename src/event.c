@@ -6,16 +6,6 @@
 //  - Zero allocation in hot path
 //  - Zero context switches in steady state
 
-#ifndef NOLIBC
-#define _GNU_SOURCE
-#include <sched.h>
-#include <signal.h>
-#include <sys/socket.h>
-#include <sys/uio.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#endif
-
 #include "core.h"
 #include "event.h"
 #include "util.h"
@@ -209,11 +199,7 @@ static inline void prep_setsockopt_direct(struct io_uring_sqe *sqe, int idx,
 static int create_listen_socket(u16 port, int cpu) {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (fd < 0) {
-#ifdef NOLIBC
         LOG_FATAL("socket: error %d", fd);
-#else
-        LOG_FATAL("socket: %s", strerror(errno));
-#endif
         return -1;
     }
 
@@ -234,22 +220,14 @@ static int create_listen_socket(u16 port, int cpu) {
     int ret;
     ret = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
     if (ret < 0) {
-#ifdef NOLIBC
         LOG_FATAL("bind: error %d", ret);
-#else
-        LOG_FATAL("bind: %s", strerror(errno));
-#endif
         close(fd);
         return -1;
     }
 
     ret = listen(fd, LISTEN_BACKLOG);
     if (ret < 0) {
-#ifdef NOLIBC
         LOG_FATAL("listen: error %d", ret);
-#else
-        LOG_FATAL("listen: %s", strerror(errno));
-#endif
         close(fd);
         return -1;
     }
@@ -624,7 +602,7 @@ static void event_loop(struct server_ctx *ctx) {
 
 int server_run(u16 port, int cpu) {
 #ifdef DEBUG
-    fprintf(stderr, "=== DEBUG BUILD - NOT FOR PRODUCTION ===\n");
+    _fmt_write(2, "=== DEBUG BUILD - NOT FOR PRODUCTION ===\n");
 #endif
 
     LOG_INFO("io_uring server starting - port=%d cpu=%d sq=%d cq=%d bufs=%dx%d",
@@ -639,19 +617,10 @@ int server_run(u16 port, int cpu) {
 
     mem_zero_aligned(g_conns, sizeof(g_conns));
 
-#ifdef NOLIBC
     if (k_sigaction(SIGINT, signal_handler) < 0)
         LOG_WARN("sigaction(SIGINT) failed");
     if (k_sigaction(SIGTERM, signal_handler) < 0)
         LOG_WARN("sigaction(SIGTERM) failed");
-#else
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = signal_handler;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-#endif
 
     // Initialize SEND template with runtime address
     SQE_TEMPLATE_SEND.addr = (u64)HTTP_200_RESPONSE;
