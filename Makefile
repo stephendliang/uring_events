@@ -1,10 +1,11 @@
-CC       ?= gcc
-BINARY   := event
-SRC      := src/main.c src/event.c src/uring.c
-HEADERS  := $(wildcard src/*.h)
+CC           ?= gcc
+BINARY       := event
+BINARY_DEBUG := event-debug
+SRC          := src/main.c src/event.c src/uring.c
+HEADERS      := $(wildcard src/*.h)
 
 CFLAGS_COMMON := -std=gnu11 -Wall -Wextra -Werror \
-    -ffreestanding -nostdlib -nostartfiles -static \
+    -ffreestanding -nostdlib -nostartfiles -static-pie -fPIE \
     -fno-stack-protector
 
 CFLAGS_RELEASE := $(CFLAGS_COMMON) -O3 -march=native -mtune=native \
@@ -22,8 +23,10 @@ release: $(BINARY)
 $(BINARY): $(SRC) $(HEADERS)
 	$(CC) $(CFLAGS_RELEASE) $(SRC) -o $(BINARY)
 
-debug: $(SRC) $(HEADERS)
-	$(CC) $(CFLAGS_DEBUG) $(SRC) -o $(BINARY)
+debug: $(BINARY_DEBUG)
+
+$(BINARY_DEBUG): $(SRC) $(HEADERS)
+	$(CC) $(CFLAGS_DEBUG) $(SRC) -o $(BINARY_DEBUG)
 
 clean:
-	rm -f $(BINARY)
+	rm -f $(BINARY) $(BINARY_DEBUG)

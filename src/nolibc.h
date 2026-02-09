@@ -323,6 +323,57 @@ __attribute__((naked, noreturn, used, externally_visible))
 void _start(void) {
     __asm__ volatile (
         "xor  %%ebp, %%ebp\n\t"       /* ABI: clear frame pointer */
+
+        /* --- static-pie self-relocation ----------------------------- */
+        /* With -static-pie -nostartfiles, no crt processes relocations */
+        /* for us.  Walk .rela.dyn and apply R_X86_64_RELATIVE entries  */
+        /* (type 8) before touching anything that needs a relocation.   */
+        /* All addressing here is RIP-relative — no relocs needed.      */
+
+        "lea  __ehdr_start(%%rip), %%r12\n\t"  /* r12 = runtime base   */
+        "lea  _DYNAMIC(%%rip), %%r13\n\t"      /* r13 = &_DYNAMIC[0]   */
+
+        /* Scan _DYNAMIC for DT_RELA (7) and DT_RELASZ (8) */
+        "xor  %%r14d, %%r14d\n\t"              /* r14 = rela ptr       */
+        "xor  %%r15d, %%r15d\n\t"              /* r15 = rela size      */
+    "1:\n\t"
+        "movq 0(%%r13), %%rax\n\t"             /* d_tag                */
+        "test %%rax, %%rax\n\t"                /* DT_NULL → done       */
+        "jz   3f\n\t"
+        "cmp  $7, %%rax\n\t"                   /* DT_RELA              */
+        "jne  2f\n\t"
+        "movq 8(%%r13), %%r14\n\t"             /* d_val = rela offset  */
+        "add  %%r12, %%r14\n\t"                /* absolute rela ptr    */
+        "jmp  4f\n\t"
+    "2:\n\t"
+        "cmp  $8, %%rax\n\t"                   /* DT_RELASZ            */
+        "jne  4f\n\t"
+        "movq 8(%%r13), %%r15\n\t"             /* d_val = total size   */
+    "4:\n\t"
+        "add  $16, %%r13\n\t"                  /* next Elf64_Dyn       */
+        "jmp  1b\n\t"
+
+        /* Apply relocations: r14 = start, r15 = remaining bytes */
+    "3:\n\t"
+        "test %%r14, %%r14\n\t"                /* no DT_RELA found?    */
+        "jz   6f\n\t"
+    "5:\n\t"
+        "test %%r15, %%r15\n\t"                /* bytes left?          */
+        "jz   6f\n\t"
+        "movq 8(%%r14), %%rax\n\t"             /* r_info               */
+        "cmp  $8, %%eax\n\t"                   /* R_X86_64_RELATIVE?   */
+        "jne  7f\n\t"
+        "movq 0(%%r14), %%rcx\n\t"             /* r_offset             */
+        "movq 16(%%r14), %%rdx\n\t"            /* r_addend             */
+        "add  %%r12, %%rdx\n\t"                /* base + addend        */
+        "movq %%rdx, (%%r12,%%rcx)\n\t"        /* *(base+offset) = ^  */
+    "7:\n\t"
+        "add  $24, %%r14\n\t"                  /* sizeof(Elf64_Rela)   */
+        "sub  $24, %%r15\n\t"
+        "jmp  5b\n\t"
+        /* --- end self-relocation ------------------------------------ */
+
+    "6:\n\t"
         "mov  (%%rsp), %%edi\n\t"      /* argc */
         "lea  8(%%rsp), %%rsi\n\t"     /* argv */
         "and  $-16, %%rsp\n\t"         /* align stack to 16 */
