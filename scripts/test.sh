@@ -112,7 +112,6 @@ validate_source() {
         "IORING_SETUP_SUBMIT_ALL"
         "IORING_SETUP_SINGLE_ISSUER"
         "IORING_SETUP_DEFER_TASKRUN"
-        "IORING_SETUP_COOP_TASKRUN"
     )
 
     for flag in "${required_flags[@]}"; do

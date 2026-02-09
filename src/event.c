@@ -1,7 +1,7 @@
 // Raw io_uring HTTP server - No liburing, maximum performance
 //  - Shared-nothing per-core isolation
 //  - No liburing (direct syscalls + ring manipulation)
-//  - IORING_SETUP_SUBMIT_ALL, SINGLE_ISSUER, DEFER_TASKRUN, COOP_TASKRUN
+//  - IORING_SETUP_SUBMIT_ALL, SINGLE_ISSUER, DEFER_TASKRUN
 //  - Multishot accept + multishot recv with provided buffers
 //  - Zero allocation in hot path
 //  - Zero context switches in steady state
@@ -101,7 +101,7 @@ static struct io_uring_sqe SQE_TEMPLATE_SEND = { // non-const: addr set at init
 CACHE_ALIGN
 static const struct io_uring_sqe SQE_TEMPLATE_CLOSE = {
     .opcode = IORING_OP_CLOSE,
-    .flags  = IOSQE_FIXED_FILE,
+    .flags  = IOSQE_FIXED_FILE | IOSQE_CQE_SKIP_SUCCESS,
 };
 
 // ZC buffer group ID - distinct from recv buffer group
@@ -250,10 +250,10 @@ static int set_cpu_affinity(int cpu) {
 // Server context - cache-line optimized layout
 struct server_ctx {
     // === HOT: accessed every CQE iteration (first cache line) ===
-    struct buf_ring br;              // 28 bytes, buffer recycling
-    sig_atomic_t running;            // +28: Loop condition
-    int listen_fd;                   // +32: Moved here to eliminate padding hole
-    u8 _pad_hot[28];                 // +36: Pad to 64 bytes
+    struct buf_ring br;              // 32 bytes, buffer recycling
+    sig_atomic_t running;            // +32: Loop condition
+    int listen_fd;                   // +36: Moved here to eliminate padding hole
+    u8 _pad_hot[24];                 // +40: Pad to 64 bytes
 
     // === WARM: accessed per batch ===
     struct uring ring;               // SQ/CQ access
@@ -584,7 +584,6 @@ static void event_loop(struct server_ctx *ctx) {
 
         // Write back cached tail and sync if buffers were recycled
         ctx->br.tail = br_tail;
-        ctx->recv_grp->tail = br_tail;  // Keep recv_grp in sync
         if (br_tail != br_tail_start)
             buf_ring_sync(&ctx->br);
         smp_store_release(cq->khead, head);
@@ -705,8 +704,13 @@ int server_run(u16 port, int cpu) {
     // Cleanup buffer ring manager (unregisters from kernel, single munmap)
     buf_ring_mgr_destroy(&ctx.ring, &ctx.br_mgr);
 
-    // listen_fd is now a fixed file index - gets cleaned up with ring.
-    // Only close the ring fd
+    // Unregister ring fd slot (if registered) before closing
+    if (ctx.ring.registered_index >= 0) {
+        struct io_uring_rsrc_update up = {
+            .offset = (u32)ctx.ring.registered_index,
+        };
+        io_uring_register(ctx.ring.ring_fd, IORING_UNREGISTER_RING_FDS, &up, 1);
+    }
     close(ctx.ring.ring_fd);
 
     LOG_INFO("Server stopped");

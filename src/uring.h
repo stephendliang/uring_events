@@ -42,6 +42,28 @@
 #define IORING_CQE_F_NOTIF (1U << 3)
 #endif
 
+// Ring fd registration (kernel 6.4+)
+#ifndef IORING_REGISTER_RING_FDS
+#define IORING_REGISTER_RING_FDS 20
+#endif
+
+#ifndef IORING_UNREGISTER_RING_FDS
+#define IORING_UNREGISTER_RING_FDS 21
+#endif
+
+#ifndef IORING_ENTER_REGISTERED_RING
+#define IORING_ENTER_REGISTERED_RING (1U << 4)
+#endif
+
+// Sparse file registration (kernel 5.19+)
+#ifndef IORING_REGISTER_FILES2
+#define IORING_REGISTER_FILES2 13
+#endif
+
+#ifndef IORING_RSRC_REGISTER_SPARSE
+#define IORING_RSRC_REGISTER_SPARSE (1U << 0)
+#endif
+
 // Buffer ring configuration limits
 enum {
     BUF_RING_MAX_GROUPS  = 2,   // recv + ZC only
@@ -99,6 +121,7 @@ struct uring {
     struct uring_sq sq;
     struct uring_cq cq;
     int ring_fd;
+    int registered_index;   // IORING_REGISTER_RING_FDS index, or -1 if unregistered
     u32 features;
     u32 flags;  // Accepted setup flags
 };
@@ -270,7 +293,15 @@ static inline int uring_submit_and_wait(struct uring *ring,
         .ts = (u64)ts,
     };
 
-    long ret = sys_io_uring_enter(ring->ring_fd, to_submit, wait_nr,
+    // Use registered ring fd index if available — skips fd→file lookup
+    // in kernel (~40-60 cycles saved per syscall)
+    int enter_fd = ring->ring_fd;
+    if (ring->registered_index >= 0) {
+        enter_fd = ring->registered_index;
+        flags |= IORING_ENTER_REGISTERED_RING;
+    }
+
+    long ret = sys_io_uring_enter(enter_fd, to_submit, wait_nr,
                                    flags, &arg, sizeof(arg));
 
     if (unlikely(ret < 0)) {

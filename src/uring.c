@@ -94,10 +94,10 @@ int uring_init(struct uring *ring, u32 sq_entries, u32 cq_entries) {
     *ring = (struct uring){0};
     int ret;
 
+    // DEFER_TASKRUN subsumes COOP_TASKRUN — kernel ignores COOP when DEFER is set
     u32 flags = IORING_SETUP_SUBMIT_ALL |
                 IORING_SETUP_SINGLE_ISSUER |
                 IORING_SETUP_DEFER_TASKRUN |
-                IORING_SETUP_COOP_TASKRUN |
                 IORING_SETUP_CQSIZE;
 
     p.flags = flags | IORING_SETUP_NO_SQARRAY;
@@ -117,6 +117,7 @@ int uring_init(struct uring *ring, u32 sq_entries, u32 cq_entries) {
 
     ring->features = p.features;
     ring->flags = p.flags;  // Store what kernel accepted
+    ring->registered_index = -1;  // Not yet registered
 
     ret = uring_mmap(ring, &p);
     if (unlikely(ret < 0)) {
@@ -124,11 +125,30 @@ int uring_init(struct uring *ring, u32 sq_entries, u32 cq_entries) {
         return ret;
     }
 
+    // Register the ring fd — skips fd→file lookup per io_uring_enter() call
+    // (~40-60 cycles saved per syscall). Requires kernel 6.4+.
+    struct io_uring_rsrc_update up = { .offset = (u32)-1, .data = ring->ring_fd };
+    int rr = io_uring_register(ring->ring_fd, IORING_REGISTER_RING_FDS, &up, 1);
+    if (rr == 1)
+        ring->registered_index = (int)up.offset;
+    // else: fallback — registered_index stays -1, uses raw ring_fd
+
     return 0;
 }
 
 int uring_register_fixed_files(struct uring *ring, u32 count) {
-    // Allocate sparse fd array - all slots initialized to -1
+    // Try sparse registration first (kernel 5.19+) — kernel initializes
+    // empty table internally, no userspace allocation needed.
+    struct io_uring_rsrc_register reg = {
+        .nr = count,
+        .flags = IORING_RSRC_REGISTER_SPARSE,
+    };
+    int ret = io_uring_register(ring->ring_fd, IORING_REGISTER_FILES2,
+                                &reg, sizeof(reg));
+    if (ret >= 0)
+        return ret;
+
+    // Fallback: allocate sparse fd array, fill with -1
     size_t size = count * sizeof(int);
     int *fds = mmap(NULL, size, PROT_READ | PROT_WRITE,
                     MAP_ANONYMOUS | MAP_PRIVATE | MAP_POPULATE, -1, 0);
@@ -137,7 +157,7 @@ int uring_register_fixed_files(struct uring *ring, u32 count) {
 
     mem_fill_nt(fds, 0xFF, size);  // -1 = empty slot
 
-    int ret = io_uring_register(ring->ring_fd, IORING_REGISTER_FILES, fds, count);
+    ret = io_uring_register(ring->ring_fd, IORING_REGISTER_FILES, fds, count);
     munmap(fds, size);  // Kernel copied it, we can free
     return ret;
 }
