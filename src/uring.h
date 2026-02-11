@@ -42,6 +42,29 @@
 #define IORING_CQE_F_NOTIF (1U << 3)
 #endif
 
+// Zero-copy recv constants (kernel 6.12+)
+#ifndef IORING_SETUP_CQE32
+#define IORING_SETUP_CQE32       (1U << 11)
+#endif
+#ifndef IORING_SETUP_CQE_MIXED
+#define IORING_SETUP_CQE_MIXED   (1U << 18)
+#endif
+#ifndef IORING_OP_RECV_ZC
+#define IORING_OP_RECV_ZC        64
+#endif
+#ifndef IORING_REGISTER_ZCRX_IFQ
+#define IORING_REGISTER_ZCRX_IFQ 32
+#endif
+#ifndef IORING_ZCRX_AREA_SHIFT
+#define IORING_ZCRX_AREA_SHIFT   48
+#endif
+#ifndef IORING_ZCRX_AREA_MASK
+#define IORING_ZCRX_AREA_MASK    (~(((__u64)1 << IORING_ZCRX_AREA_SHIFT) - 1))
+#endif
+#ifndef IORING_MEM_REGION_TYPE_USER
+#define IORING_MEM_REGION_TYPE_USER 1
+#endif
+
 // Ring fd registration (kernel 6.4+)
 #ifndef IORING_REGISTER_RING_FDS
 #define IORING_REGISTER_RING_FDS 20
@@ -105,7 +128,8 @@ struct uring_cq {
     u32 *ktail;                     // +8:  Loaded every loop
     struct io_uring_cqe *cqes;      // +16: Indexed every CQE
     u32 ring_mask;                  // +24: Used every CQE index
-    u32 _pad0;                      // +28: Explicit padding
+    u8  cqe_shift;                  // +28: 4 for 16B CQEs, 5 for 32B CQE slots
+    u8  _pad0[3];                   // +29: Explicit padding
 
     // === Cold init-time (remaining 48 bytes) ===
     u32 *kring_mask;                // +32
@@ -185,6 +209,32 @@ struct buf_ring_mgr {
 };
 // Total: 88 bytes (shrunk from 104)
 
+// Zero-copy recv context — NIC DMAs packet data directly into userspace area
+struct zcrx_ctx {
+    // === Hot path (first 32 bytes): refill ring ===
+    u32 *rq_head;                       // +0:  kernel updates
+    u32 *rq_tail;                       // +8:  we update
+    struct io_uring_zcrx_rqe *rqes;     // +16
+    u32 rq_tail_cached;                 // +24: batched local tail
+    u32 rq_mask;                        // +28: rq_entries - 1
+
+    // === Address calc (next 16 bytes) ===
+    u8  *area;                          // +32: zero-copy area base
+    u64 area_token;                     // +40: from kernel, for refill offset
+
+    // === Cold (next 24 bytes) ===
+    u64 area_size;                      // +48: for munmap
+    void *rq_ring_ptr;                  // +56: for munmap
+    u64 rq_ring_size;                   // +64: for munmap
+    u32 rq_entries;                     // +72
+    u32 zcrx_id;                        // +76
+    u32 if_idx;                         // +80
+    u32 if_rxq;                         // +84
+    u8  enabled;                        // +88
+    u8  _pad[7];                        // +89-95
+};
+// Total: 96 bytes
+
 // Legacy single-group struct for backwards compatibility
 struct buf_ring {
     struct io_uring_buf_ring *br;
@@ -208,6 +258,8 @@ _Static_assert(sizeof(struct uring_sq) == 104,
                "uring_sq layout changed");
 _Static_assert(sizeof(struct buf_ring_mgr) == 88,
                "buf_ring_mgr layout changed");
+_Static_assert(sizeof(struct zcrx_ctx) == 96,
+               "zcrx_ctx layout changed");
 
 // Hot field offset verification
 _Static_assert(offsetof(struct buf_ring_group, tail) == 0,
@@ -242,6 +294,12 @@ int buf_ring_mgr_init(struct uring *ring, struct buf_ring_mgr *mgr,
                        const struct buf_ring_config *configs, u8 num_configs);
 void buf_ring_mgr_destroy(struct uring *ring, struct buf_ring_mgr *mgr);
 int buf_ring_zc_probe(struct uring *ring);
+
+// Zero-copy recv — cold-path registration/teardown
+int  zcrx_probe(struct uring *ring);
+int  zcrx_init(struct uring *ring, struct zcrx_ctx *zcrx,
+               u32 if_idx, u32 if_rxq, u64 area_size, u32 rq_entries);
+void zcrx_destroy(struct uring *ring, struct zcrx_ctx *zcrx);
 
 // SQE fetch - OPTIMIZED: no memset, minimal work
 static inline struct io_uring_sqe *uring_get_sqe(struct uring *ring) {
@@ -418,5 +476,26 @@ static inline void buf_ring_zc_push(struct buf_ring_mgr *mgr,
     buf->bid = bid;
     g->tail++;
     // Caller must call buf_ring_mgr_sync() after batch
+}
+
+// Zero-copy recv hot-path inlines
+
+// Return buffer to kernel. No barrier — call zcrx_refill_sync() after batch.
+static inline void zcrx_refill(struct zcrx_ctx *zcrx, u64 area_off, u32 len) {
+    u32 tail = zcrx->rq_tail_cached;
+    struct io_uring_zcrx_rqe *rqe = &zcrx->rqes[tail & zcrx->rq_mask];
+    rqe->off = ((u64)zcrx->area_token << IORING_ZCRX_AREA_SHIFT) | area_off;
+    rqe->len = len;
+    zcrx->rq_tail_cached = tail + 1;
+}
+
+// Publish refill ring tail. Call once after batch.
+static inline void zcrx_refill_sync(struct zcrx_ctx *zcrx) {
+    smp_store_release(zcrx->rq_tail, zcrx->rq_tail_cached);
+}
+
+// Extract data pointer from zcrx CQE offset.
+static inline const u8 *zcrx_data(const struct zcrx_ctx *zcrx, u64 zcqe_off) {
+    return zcrx->area + (zcqe_off & ~IORING_ZCRX_AREA_MASK);
 }
 

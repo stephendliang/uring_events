@@ -10,10 +10,14 @@ static int uring_mmap(struct uring *ring, const struct io_uring_params *p) {
     size_t size;
     int ret;
 
+    // CQE slot size: 32 bytes with CQE32 or CQE_MIXED, else 16 bytes
+    u32 cqe_slot_size = (p->flags & (IORING_SETUP_CQE32 | IORING_SETUP_CQE_MIXED))
+                        ? 32 : sizeof(struct io_uring_cqe);
+
     // SQ ring mapping.
     // With NO_SQARRAY, sq_off.array is 0, so use CQ end as size.
     if (p->flags & IORING_SETUP_NO_SQARRAY)
-        size = p->cq_off.cqes + p->cq_entries * sizeof(struct io_uring_cqe);
+        size = p->cq_off.cqes + p->cq_entries * cqe_slot_size;
     else
         size = p->sq_off.array + p->sq_entries * sizeof(u32);
     sq->ring_sz = size;
@@ -29,7 +33,7 @@ static int uring_mmap(struct uring *ring, const struct io_uring_params *p) {
         cq->ring_ptr = sq->ring_ptr;
         cq->ring_sz = 0;
     } else {
-        size = p->cq_off.cqes + p->cq_entries * sizeof(struct io_uring_cqe);
+        size = p->cq_off.cqes + p->cq_entries * cqe_slot_size;
         cq->ring_sz = size;
         cq->ring_ptr = (u8 *)mmap(NULL, size, PROT_READ | PROT_WRITE,
                                   MAP_SHARED | MAP_POPULATE, ring->ring_fd,
@@ -83,8 +87,9 @@ static int uring_mmap(struct uring *ring, const struct io_uring_params *p) {
     cq->koverflow = (u32 *)(cq->ring_ptr + p->cq_off.overflow);
     cq->cqes = (struct io_uring_cqe *)(cq->ring_ptr + p->cq_off.cqes);
 
-    // Cache ring mask
+    // Cache ring mask and CQE shift
     cq->ring_mask = *cq->kring_mask;
+    cq->cqe_shift = (p->flags & (IORING_SETUP_CQE32 | IORING_SETUP_CQE_MIXED)) ? 5 : 4;
 
     return 0;
 }
@@ -100,17 +105,25 @@ int uring_init(struct uring *ring, u32 sq_entries, u32 cq_entries) {
                 IORING_SETUP_DEFER_TASKRUN |
                 IORING_SETUP_CQSIZE;
 
-    p.flags = flags | IORING_SETUP_NO_SQARRAY;
-    p.cq_entries = cq_entries;
+    // Retry cascade: try best flags first, fall back on -EINVAL.
+    // Level 1: NO_SQARRAY + CQE_MIXED (optimal for zcrx, 6.12+)
+    // Level 2: NO_SQARRAY + CQE32     (zcrx compat, 6.12+)
+    // Level 3: NO_SQARRAY              (no zcrx possible)
+    // Level 4: base flags only         (oldest compat)
+    static const u32 extra_flags[] = {
+        IORING_SETUP_NO_SQARRAY | IORING_SETUP_CQE_MIXED,
+        IORING_SETUP_NO_SQARRAY | IORING_SETUP_CQE32,
+        IORING_SETUP_NO_SQARRAY,
+        0,
+    };
 
-    ring->ring_fd = io_uring_setup(sq_entries, &p);
-    if (ring->ring_fd == -EINVAL) {
-        // Kernel may not support NO_SQARRAY — retry without.
-        // Reset p fully since kernel may have partially modified it.
+    for (int i = 0; i < (int)(sizeof(extra_flags)/sizeof(extra_flags[0])); i++) {
         p = (struct io_uring_params){0};
-        p.flags = flags;
+        p.flags = flags | extra_flags[i];
         p.cq_entries = cq_entries;
         ring->ring_fd = io_uring_setup(sq_entries, &p);
+        if (ring->ring_fd != -EINVAL)
+            break;
     }
     if (unlikely(ring->ring_fd < 0))
         return ring->ring_fd;
@@ -324,4 +337,125 @@ int buf_ring_zc_probe(struct uring *ring) {
 
     munmap(probe, alloc_size);
     return supported ? 0 : -EOPNOTSUPP;
+}
+
+int zcrx_probe(struct uring *ring) {
+    // zcrx requires CQE32 or CQE_MIXED ring setup
+    if (!(ring->flags & (IORING_SETUP_CQE32 | IORING_SETUP_CQE_MIXED)))
+        return -EOPNOTSUPP;
+
+    // Probe for IORING_OP_RECV_ZC support
+    size_t probe_size = sizeof(struct io_uring_probe) + 256 * sizeof(struct io_uring_probe_op);
+    size_t alloc_size = (probe_size + 63) & ~(size_t)63;
+
+    struct io_uring_probe *probe = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE,
+                                         MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (IS_MMAP_ERR(probe))
+        return -ENOMEM;
+
+    mem_zero_aligned(probe, alloc_size);
+    probe->last_op = 255;
+
+    int ret = io_uring_register(ring->ring_fd, IORING_REGISTER_PROBE, probe, 256);
+    if (ret < 0) {
+        munmap(probe, alloc_size);
+        return ret;
+    }
+
+    int supported = (probe->last_op >= IORING_OP_RECV_ZC) &&
+                    (probe->ops[IORING_OP_RECV_ZC].flags & IO_URING_OP_SUPPORTED);
+
+    munmap(probe, alloc_size);
+    return supported ? 0 : -EOPNOTSUPP;
+}
+
+int zcrx_init(struct uring *ring, struct zcrx_ctx *zcrx,
+              u32 if_idx, u32 if_rxq, u64 area_size, u32 rq_entries) {
+    *zcrx = (struct zcrx_ctx){0};
+
+    // mmap zero-copy area — try huge pages first
+    u8 *area = mmap(NULL, area_size, PROT_READ | PROT_WRITE,
+                    MAP_ANONYMOUS | MAP_PRIVATE | MAP_HUGETLB, -1, 0);
+    if (IS_MMAP_ERR(area)) {
+        area = mmap(NULL, area_size, PROT_READ | PROT_WRITE,
+                    MAP_ANONYMOUS | MAP_PRIVATE | MAP_POPULATE, -1, 0);
+        if (IS_MMAP_ERR(area))
+            return MMAP_ERR(area);
+    }
+
+    // mmap refill ring region (page-aligned)
+    u64 rq_ring_size = (u64)rq_entries * sizeof(struct io_uring_zcrx_rqe) + 4096;
+    rq_ring_size = (rq_ring_size + 4095) & ~(u64)4095;
+    void *rq_ring_ptr = mmap(NULL, rq_ring_size, PROT_READ | PROT_WRITE,
+                              MAP_ANONYMOUS | MAP_PRIVATE | MAP_POPULATE, -1, 0);
+    if (IS_MMAP_ERR(rq_ring_ptr)) {
+        int err = MMAP_ERR(rq_ring_ptr);
+        munmap(area, area_size);
+        return err;
+    }
+
+    // Fill registration structs
+    struct io_uring_zcrx_area_reg area_reg = {
+        .addr = (u64)area,
+        .len = area_size,
+    };
+
+    struct io_uring_region_desc region = {
+        .user_addr = (u64)rq_ring_ptr,
+        .size = rq_ring_size,
+        .flags = IORING_MEM_REGION_TYPE_USER,
+    };
+
+    struct io_uring_zcrx_ifq_reg ifq_reg = {
+        .if_idx = if_idx,
+        .if_rxq = if_rxq,
+        .rq_entries = rq_entries,
+        .area_ptr = (u64)&area_reg,
+        .region_ptr = (u64)&region,
+    };
+
+    int ret = io_uring_register(ring->ring_fd, IORING_REGISTER_ZCRX_IFQ,
+                                 &ifq_reg, 1);
+    if (ret < 0) {
+        munmap(rq_ring_ptr, rq_ring_size);
+        munmap(area, area_size);
+        return ret;
+    }
+
+    // Extract kernel-filled values
+    zcrx->area = area;
+    zcrx->area_size = area_size;
+    zcrx->area_token = area_reg.rq_area_token;
+    zcrx->rq_ring_ptr = rq_ring_ptr;
+    zcrx->rq_ring_size = rq_ring_size;
+    zcrx->rq_entries = ifq_reg.rq_entries;
+    zcrx->rq_mask = ifq_reg.rq_entries - 1;
+    zcrx->zcrx_id = ifq_reg.zcrx_id;
+    zcrx->if_idx = if_idx;
+    zcrx->if_rxq = if_rxq;
+
+    // Setup refill ring pointers from kernel offsets
+    u8 *rq_base = (u8 *)rq_ring_ptr;
+    zcrx->rq_head = (u32 *)(rq_base + ifq_reg.offsets.head);
+    zcrx->rq_tail = (u32 *)(rq_base + ifq_reg.offsets.tail);
+    zcrx->rqes = (struct io_uring_zcrx_rqe *)(rq_base + ifq_reg.offsets.rqes);
+    zcrx->rq_tail_cached = *zcrx->rq_tail;
+    zcrx->enabled = 1;
+
+    return 0;
+}
+
+void zcrx_destroy(struct uring *ring, struct zcrx_ctx *zcrx) {
+    (void)ring;  // Kernel cleanup happens on ring fd close
+    if (!zcrx->enabled)
+        return;
+    if (zcrx->area) {
+        munmap(zcrx->area, zcrx->area_size);
+        zcrx->area = NULL;
+    }
+    if (zcrx->rq_ring_ptr) {
+        munmap(zcrx->rq_ring_ptr, zcrx->rq_ring_size);
+        zcrx->rq_ring_ptr = NULL;
+    }
+    zcrx->enabled = 0;
 }

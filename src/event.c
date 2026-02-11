@@ -60,6 +60,7 @@ enum op_type {
     OP_CLOSE      = 3,
     OP_SETSOCKOPT = 4,
     OP_SEND_ZC    = 5,
+    OP_RECV_ZC    = 6,
 };
 
 // Pre-shifted operation codes for faster encoding
@@ -69,6 +70,7 @@ enum op_type {
 #define OP_CLOSE_SHIFTED      ((u64)OP_CLOSE << 32)
 #define OP_SETSOCKOPT_SHIFTED ((u64)OP_SETSOCKOPT << 32)
 #define OP_SEND_ZC_SHIFTED    ((u64)OP_SEND_ZC << 32)
+#define OP_RECV_ZC_SHIFTED    ((u64)OP_RECV_ZC << 32)
 
 // SQE templates — 64-byte aligned for SIMD copy, fd/user_data patched per-op
 #define CACHE_ALIGN __attribute__((aligned(64)))
@@ -123,12 +125,34 @@ _Static_assert((ZC_NUM_BUFFERS & (ZC_NUM_BUFFERS - 1)) == 0,
 _Static_assert((1 << ZC_BUFFER_SHIFT) == ZC_BUFFER_SIZE,
                "ZC_BUFFER_SHIFT must match ZC_BUFFER_SIZE");
 
+// Zero-copy recv configuration
+#ifndef ZCRX_AREA_SIZE
+#define ZCRX_AREA_SIZE   (1 << 20)   // 1MB zero-copy area
+#endif
+#ifndef ZCRX_RQ_ENTRIES
+#define ZCRX_RQ_ENTRIES  4096         // Refill ring entries
+#endif
+#ifndef ZCRX_IF_IDX
+#define ZCRX_IF_IDX      2            // NIC interface index, override with -DZCRX_IF_IDX=N
+#endif
+#ifndef ZCRX_IF_RXQ
+#define ZCRX_IF_RXQ      0            // NIC RX queue index, override with -DZCRX_IF_RXQ=N
+#endif
+
 CACHE_ALIGN
 static const struct io_uring_sqe SQE_TEMPLATE_SEND_ZC = {
     .opcode    = IORING_OP_SEND_ZC,
     .flags     = IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT,
     .ioprio    = IORING_RECVSEND_BUNDLE,
     .buf_group = ZC_BUFFER_GROUP_ID,
+};
+
+CACHE_ALIGN
+static struct io_uring_sqe SQE_TEMPLATE_RECV_ZC = {  // non-const: zcrx_ifq_idx patched at init
+    .opcode = IORING_OP_RECV_ZC,
+    .flags  = IOSQE_FIXED_FILE,
+    .ioprio = IORING_RECV_MULTISHOT,
+    .len    = 0,
 };
 
 // Connection state - bit-packed for cache efficiency
@@ -177,6 +201,9 @@ static inline bool is_benign_err(int err) {
 
 #define prep_send_zc_direct(sqe, fd, buf_idx) \
     PREP_SQE(sqe, SQE_TEMPLATE_SEND_ZC, fd, OP_SEND_ZC_SHIFTED | (u32)(fd) | ((u64)(buf_idx) << 40))
+
+#define prep_recv_zc_multishot_direct(sqe, fd) \
+    PREP_SQE(sqe, SQE_TEMPLATE_RECV_ZC, fd, OP_RECV_ZC_SHIFTED | (u32)(fd))
 
 // SETSOCKOPT: SIMD zero + scalar patches. SQEs are 64-byte aligned.
 static inline void prep_setsockopt_direct(struct io_uring_sqe *sqe, int idx,
@@ -253,7 +280,9 @@ struct server_ctx {
     struct buf_ring br;              // 32 bytes, buffer recycling
     sig_atomic_t running;            // +32: Loop condition
     int listen_fd;                   // +36: Moved here to eliminate padding hole
-    u8 _pad_hot[24];                 // +40: Pad to 64 bytes
+    u8 cqe_shift;                    // +40: 4 or 5
+    u8 zcrx_active;                  // +41: 0 or 1
+    u8 _pad_hot[22];                 // +42: Pad to 64 bytes
 
     // === WARM: accessed per batch ===
     struct uring ring;               // SQ/CQ access
@@ -262,6 +291,7 @@ struct server_ctx {
     struct buf_ring_mgr br_mgr;
     struct buf_ring_group *recv_grp; // Pointer into br_mgr.groups[0]
     struct buf_ring_group *zc_grp;   // Pointer into br_mgr.groups[1], NULL if ZC disabled
+    struct zcrx_ctx zcrx;            // Zero-copy recv context
 } __attribute__((aligned(64)));
 
 // ZC enabled check: if zc_grp is non-NULL, ZC is enabled
@@ -298,7 +328,10 @@ static inline bool queue_recv(struct server_ctx *ctx, int fd) {
         LOG_ERROR("SQ full on recv fd=%d", fd);
         return false;
     }
-    prep_recv_multishot_direct(sqe, fd);
+    if (ctx->zcrx_active)
+        prep_recv_zc_multishot_direct(sqe, fd);
+    else
+        prep_recv_multishot_direct(sqe, fd);
     c->recv_active = 1;
     return true;
 }
@@ -484,6 +517,54 @@ static inline void handle_recv(struct server_ctx *ctx, struct io_uring_cqe *cqe,
     }
 }
 
+static inline void handle_recv_zc(struct server_ctx *ctx,
+                                   struct io_uring_cqe *cqe, int fd) {
+    struct conn_state *c = get_conn(fd);
+    int res = cqe->res;
+    bool more = (cqe->flags & IORING_CQE_F_MORE) != 0;
+
+    if (!more && c)
+        c->recv_active = 0;
+
+    if (unlikely(res <= 0)) {
+        if (res == 0 || is_benign_err(res)) {
+            queue_close(ctx, fd);
+        } else if (res == -ENOBUFS) {
+            LOG_WARN("ENOBUFS fd=%d (zcrx)", fd);
+            if (!more && c && !c->closing)
+                queue_recv(ctx, fd);
+        } else {
+            LOG_ERROR("recv_zc error %d fd=%d", res, fd);
+            queue_close(ctx, fd);
+        }
+        return;
+    }
+
+    // Extract zero-copy CQE from big_cqe extension
+    struct io_uring_zcrx_cqe *zcqe = (struct io_uring_zcrx_cqe *)&cqe->big_cqe[0];
+
+    // Send response — use ZC send if available, else regular send
+    if (ctx_zc_enabled(ctx)) {
+        if (unlikely(!queue_send_zc(ctx, fd, HTTP_200_RESPONSE, HTTP_200_LEN)))
+            queue_close(ctx, fd);
+    } else {
+        // Regular send with sentinel buf_idx=0xFFFF (no buffer to recycle)
+        struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
+        if (unlikely(!sqe)) {
+            LOG_ERROR("SQ full on send fd=%d (zcrx)", fd);
+            queue_close(ctx, fd);
+        } else {
+            prep_send_direct(sqe, fd, HTTP_200_RESPONSE, HTTP_200_LEN, 0xFFFF);
+        }
+    }
+
+    // Return buffer to kernel via refill ring
+    zcrx_refill(&ctx->zcrx, zcqe->off & ~IORING_ZCRX_AREA_MASK, (u32)res);
+
+    if (unlikely(!more && c && !c->closing))
+        queue_recv(ctx, fd);
+}
+
 static inline void handle_close(int fd) {
     struct conn_state *c = get_conn(fd);
     if (c) {
@@ -504,7 +585,8 @@ static void event_loop(struct server_ctx *ctx) {
     // Cache frequently accessed values
     struct uring_cq *cq = &ctx->ring.cq;
     const u32 cq_mask = cq->ring_mask;
-    struct io_uring_cqe *cqes = cq->cqes;
+    u8 *cqe_base = (u8 *)cq->cqes;
+    const u8 cs = ctx->cqe_shift;  // 4 for 16B CQEs, 5 for 32B CQE slots
 
     // Cache buf_ring invariants - these never change after init
     struct io_uring_buf_ring *const br_ring = ctx->br.br;
@@ -526,12 +608,13 @@ static void event_loop(struct server_ctx *ctx) {
         // Cache buffer ring tail locally for this batch
         u16 br_tail = ctx->br.tail;
         const u16 br_tail_start = br_tail;
+        const u32 rq_tail_start = ctx->zcrx.rq_tail_cached;
 
         while (head != tail) {
-            struct io_uring_cqe *cqe = &cqes[head & cq_mask];
+            struct io_uring_cqe *cqe = (struct io_uring_cqe *)(cqe_base + ((u64)(head & cq_mask) << cs));
 
             // Prefetch next CQE
-            prefetch_r(&cqes[(head + 1) & cq_mask]);
+            prefetch_r(cqe_base + ((u64)((head + 1) & cq_mask) << cs));
 
             u64 ud = cqe->user_data;
             i32 fd = decode_fd(ud);
@@ -548,12 +631,14 @@ static void event_loop(struct server_ctx *ctx) {
                 break;
             case OP_SEND: {
                 u16 buf_idx = decode_buf_idx(ud);
-                // Recycle buffer
-                struct io_uring_buf *buf = &br_ring->bufs[br_tail & br_mask];
-                buf->addr = (u64)(br_base + ((u32)buf_idx << BUFFER_SHIFT));
-                buf->len = BUFFER_SIZE;
-                buf->bid = buf_idx;
-                br_tail++;
+                // Recycle buffer (skip for sentinel 0xFFFF from zcrx path)
+                if (likely(buf_idx != 0xFFFF)) {
+                    struct io_uring_buf *buf = &br_ring->bufs[br_tail & br_mask];
+                    buf->addr = (u64)(br_base + ((u32)buf_idx << BUFFER_SHIFT));
+                    buf->len = BUFFER_SIZE;
+                    buf->bid = buf_idx;
+                    br_tail++;
+                }
                 int res = cqe->res;
                 if (unlikely(res < 0)) {
                     if (!is_benign_err(res))
@@ -574,6 +659,9 @@ static void event_loop(struct server_ctx *ctx) {
             case OP_SEND_ZC:
                 handle_send_zc(ctx, cqe, fd);
                 break;
+            case OP_RECV_ZC:
+                handle_recv_zc(ctx, cqe, fd);
+                break;
             default:
                 LOG_BUG("unknown op %u", op);
                 break;
@@ -586,6 +674,8 @@ static void event_loop(struct server_ctx *ctx) {
         ctx->br.tail = br_tail;
         if (br_tail != br_tail_start)
             buf_ring_sync(&ctx->br);
+        if (ctx->zcrx_active && ctx->zcrx.rq_tail_cached != rq_tail_start)
+            zcrx_refill_sync(&ctx->zcrx);
         smp_store_release(cq->khead, head);
 
         // Check for CQ overflow - silent data loss is unacceptable
@@ -658,6 +748,26 @@ int server_run(u16 port, int cpu) {
         LOG_INFO("Zerocopy send not available (ret=%d)", ret);
     }
 
+    // Zero-copy recv setup
+    ctx.cqe_shift = ctx.ring.cq.cqe_shift;
+    ctx.zcrx_active = 0;
+
+    int zcrx_ret = zcrx_probe(&ctx.ring);
+    if (zcrx_ret == 0) {
+        zcrx_ret = zcrx_init(&ctx.ring, &ctx.zcrx,
+                              ZCRX_IF_IDX, ZCRX_IF_RXQ,
+                              ZCRX_AREA_SIZE, ZCRX_RQ_ENTRIES);
+        if (zcrx_ret == 0) {
+            ctx.zcrx_active = 1;
+            SQE_TEMPLATE_RECV_ZC.zcrx_ifq_idx = ctx.zcrx.zcrx_id;
+            LOG_INFO("Zero-copy recv enabled: if_idx=%u rxq=%u", ZCRX_IF_IDX, ZCRX_IF_RXQ);
+        } else {
+            LOG_INFO("Zero-copy recv init failed (ret=%d)", zcrx_ret);
+        }
+    } else {
+        LOG_INFO("Zero-copy recv not available (ret=%d)", zcrx_ret);
+    }
+
     // Setup legacy buf_ring struct for hot path (points into br_mgr)
     ctx.br.br = BUF_RING_PTR(&ctx.br_mgr, ctx.recv_grp);
     ctx.br.buf_base = BUF_RING_DATA(&ctx.br_mgr, ctx.recv_grp);
@@ -700,6 +810,9 @@ int server_run(u16 port, int cpu) {
     LOG_INFO("Listening on port %d (fixed file index 0)", port);
 
     event_loop(&ctx);
+
+    // Cleanup zero-copy recv
+    zcrx_destroy(&ctx.ring, &ctx.zcrx);
 
     // Cleanup buffer ring manager (unregisters from kernel, single munmap)
     buf_ring_mgr_destroy(&ctx.ring, &ctx.br_mgr);
