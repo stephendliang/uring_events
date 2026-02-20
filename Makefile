@@ -16,7 +16,7 @@ CFLAGS_RELEASE := $(CFLAGS_COMMON) -O3 -march=native -mtune=native \
 
 CFLAGS_DEBUG := $(CFLAGS_COMMON) -O0 -g -DDEBUG
 
-BENCH_SRC    := src/bench_main.c src/bench.c src/uring.c
+BENCH_SRC    := src/bench_main.c src/bench.c src/bench_wal.c src/uring.c
 
 .PHONY: release debug bench bench-debug clean
 

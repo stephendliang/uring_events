@@ -2,6 +2,7 @@
 
 #include "core.h"
 #include "bench.h"
+#include "bench_wal.h"
 #include "bench_syscalls.h"
 
 // String comparison — byte-by-byte, no libc.
@@ -107,7 +108,18 @@ static void usage(void) {
     _fmt_write(2, "  cpu:    0-1023              (default: 0)\n");
     _fmt_write(2, "  path:   string              (default: /tmp/uring_bench.dat)\n\n");
     _fmt_write(2, "  bench matrix [path]         Run full test matrix\n");
-    _fmt_write(2, "  bench sweep [qd] [mb] [path]  Buf vs O_DIRECT sweep (CSV)\n");
+    _fmt_write(2, "  bench sweep [qd] [mb] [path]  Buf vs O_DIRECT sweep (CSV)\n\n");
+    _fmt_write(2, "WAL group commit:\n");
+    _fmt_write(2, "  bench wal [gs] [rs] [mode] [groups] [mb] [cpu] [path]\n");
+    _fmt_write(2, "    gs:     group size 1-256       (default: 4)\n");
+    _fmt_write(2, "    rs:     record size 512-8192   (default: 512)\n");
+    _fmt_write(2, "    mode:   buffered | direct      (default: buffered)\n");
+    _fmt_write(2, "    groups: 1-10000000             (default: 10000)\n\n");
+    _fmt_write(2, "  bench wal-sweep [cpu] [path]   WAL sweep (CSV)\n\n");
+    _fmt_write(2, "OLTP mixed:\n");
+    _fmt_write(2, "  bench oltp [rqd] [gs] [rs] [mode] [groups] [rpc] [dmb] [wmb] [cpu] [dpath] [wpath]\n");
+    _fmt_write(2, "    rqd:    read queue depth 1-4096 (default: 32)\n");
+    _fmt_write(2, "    rpc:    reads per commit 1-1000 (default: 32)\n");
 }
 
 // Run buffered vs O_DIRECT sweep across block sizes.
@@ -302,6 +314,124 @@ static int run_matrix(const char *file_path) {
     return 0;
 }
 
+// --- WAL output ---
+
+static void print_wal_result(const struct wal_config *cfg,
+                              const struct wal_result *res) {
+    _fmt_write(1, "\n--- WAL group commit: %s gs=%u rs=%u ---\n",
+               mode_name(cfg->mode), cfg->group_size, cfg->record_size);
+    u64 total_records = (u64)res->completed_groups * cfg->group_size;
+    u64 total_data_mb = (total_records * cfg->record_size) / 1048576;
+    _fmt_write(1, "Groups: %u (%u errors)  |  Records: %lu  |  Data: %lu MB\n",
+               res->completed_groups, res->error_count,
+               total_records, total_data_mb);
+    _fmt_write(1, "Commits/sec: %lu  |  Txns/sec: %lu  |  %lu MB/s\n",
+               res->commits_per_sec, res->txns_per_sec, res->throughput_mbps);
+    _fmt_write(1, "Group lat (us): avg=%lu  p50=%lu  p99=%lu  p999=%lu\n",
+               res->group_lat_avg_ns / 1000, res->group_lat_p50_ns / 1000,
+               res->group_lat_p99_ns / 1000, res->group_lat_p999_ns / 1000);
+    _fmt_write(1, "Sync  lat (us): avg=%lu  p50=%lu  p99=%lu  p999=%lu\n",
+               res->sync_lat_avg_ns / 1000, res->sync_lat_p50_ns / 1000,
+               res->sync_lat_p99_ns / 1000, res->sync_lat_p999_ns / 1000);
+    _fmt_write(1, "Total: %lu ms\n", res->total_ns / 1000000);
+}
+
+static int run_wal_sweep(int cpu, const char *wal_path) {
+    static const u32 group_sizes[] = { 1, 4, 16, 64, 256 };
+    static const u32 record_sizes[] = { 512, 1024, 4096, 8192 };
+    static const enum io_mode modes[] = { IO_BUFFERED, IO_DIRECT };
+
+    u32 total = 5 * 4 * 2;  // 40 tests
+    u32 test_num = 0, passed = 0, skipped = 0;
+
+    _fmt_write(2, "WAL sweep: 40 tests, cpu=%d, path=%s\n\n", cpu, wal_path);
+
+    // CSV header
+    _fmt_write(1, "group_size,record_size,mode,");
+    _fmt_write(1, "commits_sec,txns_sec,mbps,");
+    _fmt_write(1, "grp_avg_us,grp_p50_us,grp_p99_us,grp_p999_us,");
+    _fmt_write(1, "sync_avg_us,sync_p50_us,sync_p99_us,sync_p999_us\n");
+
+    for (u32 gi = 0; gi < 5; gi++) {
+        for (u32 ri = 0; ri < 4; ri++) {
+            for (u32 mi = 0; mi < 2; mi++) {
+                test_num++;
+                _fmt_write(2, "[%u/%u] gs=%u rs=%u %s\n",
+                           test_num, total,
+                           group_sizes[gi], record_sizes[ri],
+                           mi == 0 ? "buf" : "dir");
+
+                struct wal_config cfg = {
+                    .mode = modes[mi],
+                    .group_size = group_sizes[gi],
+                    .record_size = record_sizes[ri],
+                    .num_groups = 10000,
+                    .file_size_mb = 0,
+                    .cpu = cpu,
+                    .file_path = wal_path,
+                };
+
+                struct wal_result res = {0};
+                int ret = wal_run(&cfg, &res);
+                if (ret < 0) {
+                    if (ret == -EINVAL && modes[mi] == IO_DIRECT) {
+                        _fmt_write(2, "  (skipped: EINVAL)\n");
+                        skipped++;
+                        continue;
+                    }
+                    _fmt_write(2, "  [ERROR] %d\n", ret);
+                    continue;
+                }
+
+                _fmt_write(1, "%u,%u,%s,",
+                           group_sizes[gi], record_sizes[ri],
+                           mode_name(modes[mi]));
+                _fmt_write(1, "%lu,%lu,%lu,",
+                           res.commits_per_sec, res.txns_per_sec,
+                           res.throughput_mbps);
+                _fmt_write(1, "%lu,%lu,%lu,%lu,",
+                           res.group_lat_avg_ns / 1000,
+                           res.group_lat_p50_ns / 1000,
+                           res.group_lat_p99_ns / 1000,
+                           res.group_lat_p999_ns / 1000);
+                _fmt_write(1, "%lu,%lu,%lu,%lu\n",
+                           res.sync_lat_avg_ns / 1000,
+                           res.sync_lat_p50_ns / 1000,
+                           res.sync_lat_p99_ns / 1000,
+                           res.sync_lat_p999_ns / 1000);
+                passed++;
+            }
+        }
+    }
+
+    _fmt_write(2, "\nDone: %u passed, %u skipped\n", passed, skipped);
+    return 0;
+}
+
+static void print_oltp_result(const struct oltp_config *cfg,
+                               const struct oltp_result *res) {
+    _fmt_write(1, "\n--- OLTP mixed: %s rqd=%u gs=%u rs=%u ---\n",
+               mode_name(cfg->mode), cfg->read_qd,
+               cfg->group_size, cfg->record_size);
+    _fmt_write(1, "Reads:  %u (%u errors) | %lu IOPS | %lu MB/s\n",
+               res->read_completed, res->read_errors,
+               res->read_iops, res->read_mbps);
+    _fmt_write(1, "  Lat (us): avg=%lu  p50=%lu  p99=%lu  p999=%lu\n",
+               res->read_lat_avg_ns / 1000, res->read_lat_p50_ns / 1000,
+               res->read_lat_p99_ns / 1000, res->read_lat_p999_ns / 1000);
+    _fmt_write(1, "WAL:    %u groups (%u errors)\n",
+               res->wal_completed_groups, res->wal_errors);
+    _fmt_write(1, "  Commits/sec: %lu  |  Txns/sec: %lu\n",
+               res->commits_per_sec, res->txns_per_sec);
+    _fmt_write(1, "  Group lat (us): avg=%lu  p50=%lu  p99=%lu\n",
+               res->group_lat_avg_ns / 1000, res->group_lat_p50_ns / 1000,
+               res->group_lat_p99_ns / 1000);
+    _fmt_write(1, "  Sync  lat (us): avg=%lu  p50=%lu  p99=%lu\n",
+               res->sync_lat_avg_ns / 1000, res->sync_lat_p50_ns / 1000,
+               res->sync_lat_p99_ns / 1000);
+    _fmt_write(1, "Total: %lu ms\n", res->total_ns / 1000000);
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         usage();
@@ -331,6 +461,151 @@ int main(int argc, char *argv[]) {
         }
         if (argc > 4) path = argv[4];
         return run_sweep(path, qd, file_mb);
+    }
+
+    // WAL group commit
+    if (str_eq(argv[1], "wal")) {
+        struct wal_config cfg = {
+            .mode = IO_BUFFERED,
+            .group_size = 4,
+            .record_size = 512,
+            .num_groups = 10000,
+            .file_size_mb = 0,
+            .cpu = 0,
+            .file_path = "/tmp/uring_bench_wal.dat",
+        };
+        if (argc > 2) {
+            int gs = parse_int(argv[2], 1, 256, "group_size");
+            if (gs < 0) return 1;
+            cfg.group_size = (u32)gs;
+        }
+        if (argc > 3) {
+            int rs = parse_int(argv[3], 512, 8192, "record_size");
+            if (rs < 0) return 1;
+            cfg.record_size = (u32)rs;
+        }
+        if (argc > 4) {
+            if (str_eq(argv[4], "buffered"))       cfg.mode = IO_BUFFERED;
+            else if (str_eq(argv[4], "direct"))    cfg.mode = IO_DIRECT;
+            else {
+                _fmt_write(2, "[FATAL] WAL mode: buffered | direct\n");
+                return 1;
+            }
+        }
+        if (argc > 5) {
+            int g = parse_int(argv[5], 1, 10000000, "num_groups");
+            if (g < 0) return 1;
+            cfg.num_groups = (u32)g;
+        }
+        if (argc > 6) {
+            int mb = parse_int(argv[6], 0, 65536, "file_mb");
+            if (mb < 0) return 1;
+            cfg.file_size_mb = (u32)mb;
+        }
+        if (argc > 7) {
+            int cpu = parse_int(argv[7], 0, 1023, "cpu");
+            if (cpu < 0) return 1;
+            cfg.cpu = cpu;
+        }
+        if (argc > 8) cfg.file_path = argv[8];
+
+        struct wal_result res = {0};
+        int ret = wal_run(&cfg, &res);
+        if (ret < 0) {
+            _fmt_write(2, "[FATAL] WAL benchmark failed: %d\n", ret);
+            return 1;
+        }
+        print_wal_result(&cfg, &res);
+        return 0;
+    }
+
+    // WAL sweep
+    if (str_eq(argv[1], "wal-sweep")) {
+        int cpu = 0;
+        const char *path = "/tmp/uring_bench_wal.dat";
+        if (argc > 2) {
+            cpu = parse_int(argv[2], 0, 1023, "cpu");
+            if (cpu < 0) return 1;
+        }
+        if (argc > 3) path = argv[3];
+        return run_wal_sweep(cpu, path);
+    }
+
+    // OLTP mixed
+    if (str_eq(argv[1], "oltp")) {
+        struct oltp_config cfg = {
+            .mode = IO_BUFFERED,
+            .read_qd = 32,
+            .group_size = 4,
+            .record_size = 512,
+            .page_size = 4096,
+            .num_groups = 10000,
+            .reads_per_commit = 32,
+            .data_file_mb = 2048,
+            .wal_file_mb = 0,
+            .cpu = 0,
+            .data_path = "/tmp/uring_bench_data.dat",
+            .wal_path = "/tmp/uring_bench_wal.dat",
+        };
+        if (argc > 2) {
+            int rqd = parse_int(argv[2], 1, 4096, "read_qd");
+            if (rqd < 0) return 1;
+            cfg.read_qd = (u32)rqd;
+        }
+        if (argc > 3) {
+            int gs = parse_int(argv[3], 1, 256, "group_size");
+            if (gs < 0) return 1;
+            cfg.group_size = (u32)gs;
+        }
+        if (argc > 4) {
+            int rs = parse_int(argv[4], 512, 8192, "record_size");
+            if (rs < 0) return 1;
+            cfg.record_size = (u32)rs;
+        }
+        if (argc > 5) {
+            if (str_eq(argv[5], "buffered"))       cfg.mode = IO_BUFFERED;
+            else if (str_eq(argv[5], "direct"))    cfg.mode = IO_DIRECT;
+            else {
+                _fmt_write(2, "[FATAL] OLTP mode: buffered | direct\n");
+                return 1;
+            }
+        }
+        if (argc > 6) {
+            int g = parse_int(argv[6], 1, 10000000, "num_groups");
+            if (g < 0) return 1;
+            cfg.num_groups = (u32)g;
+        }
+        if (argc > 7) {
+            int rpc = parse_int(argv[7], 1, 1000, "reads_per_commit");
+            if (rpc < 0) return 1;
+            cfg.reads_per_commit = (u32)rpc;
+        }
+        if (argc > 8) {
+            int dmb = parse_int(argv[8], 1, 65536, "data_file_mb");
+            if (dmb < 0) return 1;
+            cfg.data_file_mb = (u32)dmb;
+        }
+        if (argc > 9) {
+            int wmb = parse_int(argv[9], 0, 65536, "wal_file_mb");
+            if (wmb < 0) return 1;
+            cfg.wal_file_mb = (u32)wmb;
+        }
+        if (argc > 10) {
+            int cpu = parse_int(argv[10], 0, 1023, "cpu");
+            if (cpu < 0) return 1;
+            cfg.cpu = cpu;
+        }
+        if (argc > 11) cfg.data_path = argv[11];
+        if (argc > 12) cfg.wal_path = argv[12];
+
+        struct oltp_result res = {0};
+        int ret = oltp_run(&cfg, &res);
+        if (ret < 0) {
+            _fmt_write(2, "[FATAL] OLTP benchmark failed: %d\n", ret);
+            return 1;
+        }
+        print_oltp_result(&cfg, &res);
+        return 0;
     }
 
     if (argc < 3) {

@@ -46,3 +46,12 @@ static inline void bench_prep_fsync(struct io_uring_sqe *sqe, int fd) {
     sqe->fd        = fd;
     sqe->user_data = BENCH_ENCODE_UD(0xFFFF);  // Sentinel
 }
+
+static inline void bench_prep_fdatasync(struct io_uring_sqe *sqe,
+                                         int fd, u64 user_data) {
+    mem_zero_cacheline(sqe);
+    sqe->opcode      = IORING_OP_FSYNC;
+    sqe->fd          = fd;
+    sqe->user_data   = user_data;
+    sqe->fsync_flags = IORING_FSYNC_DATASYNC;
+}
