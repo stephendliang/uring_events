@@ -1,7 +1,7 @@
 # Roadmap
 
 Current state: single-threaded io_uring HTTP server, freestanding 26KB binary,
-static "OK" response. See CLAUDE.md for architecture.
+static "OK" response. See [prompt.md](prompt.md) for architecture.
 
 ## Planned
 
