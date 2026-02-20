@@ -1,4 +1,7 @@
 event
+event-debug
+bench
+bench-debug
 .claude/
 build/
 *.o
