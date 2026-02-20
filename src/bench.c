@@ -251,11 +251,13 @@ int bench_run(const struct bench_config *cfg, struct bench_result *res) {
         }
     }
 
-    // Fill file for read benchmarks (writes need content to avoid sparse reads)
-    ret = bench_fill_file(fd, file_size, cfg->block_size);
-    if (ret < 0) {
-        sys_close(fd);
-        return ret;
+    // Fill file unless skip_fill is set (sweep mode pre-fills once).
+    if (!cfg->skip_fill) {
+        ret = bench_fill_file(fd, file_size, cfg->block_size);
+        if (ret < 0) {
+            sys_close(fd);
+            return ret;
+        }
     }
 
     // Drop page cache for fair cold start

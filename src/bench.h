@@ -29,6 +29,7 @@ struct bench_config {
     u32 file_size_mb;     // Test file size (0 = auto)
     int cpu;              // CPU pin (-1 = no pin)
     const char *file_path;
+    int skip_fill;            // Skip file fill (reuse existing data)
 };
 
 struct bench_result {
