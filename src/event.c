@@ -198,8 +198,6 @@ struct conn_state {
     u8 reserved    : 4;
 };
 
-CACHE_ALIGN static struct conn_state g_conns[MAX_CONNECTIONS];
-
 // Intrusive doubly-linked list for idle tracking (O(1) insert/remove/expire)
 // Index 0 = sentinel (listen socket, never idle-tracked).
 // Circular: sentinel.next = oldest, sentinel.prev = newest.
@@ -208,61 +206,100 @@ struct idle_node {
     u16 next;
 };
 
+#ifndef MULTICORE
+CACHE_ALIGN static struct conn_state g_conns[MAX_CONNECTIONS];
 static struct idle_node g_idle_list[MAX_CONNECTIONS];  // 256 KB
 static u64 g_last_activity[MAX_CONNECTIONS];           // 512 KB — raw TSC ticks
-static u64 g_idle_timeout_ticks;                       // precomputed IDLE_TIMEOUT_SEC * tsc_freq
+#endif
+
+#ifdef MULTICORE
+struct worker_data {
+    struct conn_state conns[MAX_CONNECTIONS];       // 64 KB
+    struct idle_node  idle_list[MAX_CONNECTIONS];   // 256 KB
+    u64               last_activity[MAX_CONNECTIONS]; // 512 KB
+};
+// ~832 KB per worker, mmap'd (MAP_ANONYMOUS), zeroed by kernel
+#endif
+
+// Server context - cache-line optimized layout
+struct server_ctx {
+    // === HOT: accessed every CQE iteration (first cache line) ===
+    struct buf_ring br;              // 32 bytes, buffer recycling
+    sig_atomic_t running;            // +32: Loop condition
+    int listen_fd;                   // +36: Moved here to eliminate padding hole
+    u8 _pad_hot[24];                 // +40: Pad to 64 bytes
+
+    // === WARM: accessed per batch ===
+    struct uring ring;               // SQ/CQ access
+
+    // === COLD: rarely accessed after init ===
+    struct buf_ring_mgr br_mgr;
+    struct buf_ring_group *recv_grp; // Pointer into br_mgr.groups[0]
+    struct buf_ring_group *zc_grp;   // Pointer into br_mgr.groups[1], NULL if ZC disabled
+
+    // === Per-worker connection state (was globals) ===
+    struct conn_state *conns;
+    struct idle_node  *idle_list;
+    u64               *last_activity;
+    u64               idle_timeout_ticks;
+} __attribute__((aligned(64)));
+
+// ZC enabled check: if zc_grp is non-NULL, ZC is enabled
+#define ctx_zc_enabled(ctx) ((ctx)->zc_grp != NULL)
+
+static volatile sig_atomic_t g_shutdown = 0;
 
 // Unlink node from list. Caller must check in_idle first.
-static inline void idle_unlink(u16 idx) {
-    u16 p = g_idle_list[idx].prev;
-    u16 n = g_idle_list[idx].next;
-    g_idle_list[p].next = n;
-    g_idle_list[n].prev = p;
+static inline void idle_unlink(struct server_ctx *ctx, u16 idx) {
+    u16 p = ctx->idle_list[idx].prev;
+    u16 n = ctx->idle_list[idx].next;
+    ctx->idle_list[p].next = n;
+    ctx->idle_list[n].prev = p;
 }
 
 // Move/insert connection to tail (most recent). O(1).
-static inline void idle_touch(u16 idx) {
-    struct conn_state *c = &g_conns[idx];
+static inline void idle_touch(struct server_ctx *ctx, u16 idx) {
+    struct conn_state *c = &ctx->conns[idx];
     if (c->in_idle)
-        idle_unlink(idx);
+        idle_unlink(ctx, idx);
     // Insert before sentinel (= at tail)
-    u16 tail = g_idle_list[0].prev;
-    g_idle_list[idx].prev = tail;
-    g_idle_list[idx].next = 0;
-    g_idle_list[tail].next = idx;
-    g_idle_list[0].prev = idx;
+    u16 tail = ctx->idle_list[0].prev;
+    ctx->idle_list[idx].prev = tail;
+    ctx->idle_list[idx].next = 0;
+    ctx->idle_list[tail].next = idx;
+    ctx->idle_list[0].prev = idx;
     c->in_idle = 1;
-    g_last_activity[idx] = rdtsc();
+    ctx->last_activity[idx] = rdtsc();
 }
 
 // Remove from list on close. O(1).
-static inline void idle_remove(u16 idx) {
-    struct conn_state *c = &g_conns[idx];
+static inline void idle_remove(struct server_ctx *ctx, u16 idx) {
+    struct conn_state *c = &ctx->conns[idx];
     if (c->in_idle) {
-        idle_unlink(idx);
+        idle_unlink(ctx, idx);
         c->in_idle = 0;
     }
 }
 
 // Re-insert at head (oldest position) with timestamp 0, forcing expiry on
 // next sweep tick. Used to schedule close retry when SQE submission fails.
-static inline void idle_insert_expired(u16 idx) {
-    u16 head = g_idle_list[0].next;
-    g_idle_list[idx].next = head;
-    g_idle_list[idx].prev = 0;
-    g_idle_list[0].next = idx;
-    g_idle_list[head].prev = idx;
-    g_conns[idx].in_idle = 1;
-    g_last_activity[idx] = 0;
+static inline void idle_insert_expired(struct server_ctx *ctx, u16 idx) {
+    u16 head = ctx->idle_list[0].next;
+    ctx->idle_list[idx].next = head;
+    ctx->idle_list[idx].prev = 0;
+    ctx->idle_list[0].next = idx;
+    ctx->idle_list[head].prev = idx;
+    ctx->conns[idx].in_idle = 1;
+    ctx->last_activity[idx] = 0;
 }
 
 // Static value for async setsockopt - must persist across async operation
 static int g_tcp_nodelay_val = 1;
 
-static inline struct conn_state *get_conn(int fd) {
+static inline struct conn_state *get_conn(struct server_ctx *ctx, int fd) {
     // Bounds check - returns NULL for invalid fd
     unsigned ufd = (unsigned)fd;
-    return (ufd < MAX_CONNECTIONS) ? &g_conns[ufd] : NULL;
+    return (ufd < MAX_CONNECTIONS) ? &ctx->conns[ufd] : NULL;
 }
 
 #define decode_fd(ud) ((i32)((ud) & 0xFFFFFFFF))
@@ -411,32 +448,9 @@ static int set_cpu_affinity(int cpu) {
     return sched_setaffinity(0, sizeof(cpuset), &cpuset);
 }
 
-// Server context - cache-line optimized layout
-struct server_ctx {
-    // === HOT: accessed every CQE iteration (first cache line) ===
-    struct buf_ring br;              // 32 bytes, buffer recycling
-    sig_atomic_t running;            // +32: Loop condition
-    int listen_fd;                   // +36: Moved here to eliminate padding hole
-    u8 _pad_hot[24];                 // +40: Pad to 64 bytes
-
-    // === WARM: accessed per batch ===
-    struct uring ring;               // SQ/CQ access
-
-    // === COLD: rarely accessed after init ===
-    struct buf_ring_mgr br_mgr;
-    struct buf_ring_group *recv_grp; // Pointer into br_mgr.groups[0]
-    struct buf_ring_group *zc_grp;   // Pointer into br_mgr.groups[1], NULL if ZC disabled
-} __attribute__((aligned(64)));
-
-// ZC enabled check: if zc_grp is non-NULL, ZC is enabled
-#define ctx_zc_enabled(ctx) ((ctx)->zc_grp != NULL)
-
-static struct server_ctx *g_ctx = NULL;
-
 static void signal_handler(int sig) {
     (void)sig;
-    if (g_ctx)
-        g_ctx->running = 0;
+    g_shutdown = 1;
 }
 
 // Event handlers
@@ -451,7 +465,7 @@ static inline bool queue_accept(struct server_ctx *ctx) {
 }
 
 static inline bool queue_recv(struct server_ctx *ctx, int fd) {
-    struct conn_state *c = get_conn(fd);
+    struct conn_state *c = get_conn(ctx, fd);
     if (unlikely(!c) || c->closing)
         return false;
     if (c->recv_active)
@@ -468,7 +482,7 @@ static inline bool queue_recv(struct server_ctx *ctx, int fd) {
 }
 
 static inline bool queue_send(struct server_ctx *ctx, int fd, u16 buf_idx) {
-    struct conn_state *c = get_conn(fd);
+    struct conn_state *c = get_conn(ctx, fd);
     if (unlikely(!c) || c->closing) {
         buf_ring_recycle(&ctx->br, buf_idx);
         return false;
@@ -505,7 +519,7 @@ static inline bool queue_timeout_sweep(struct server_ctx *ctx) {
 }
 
 static inline bool queue_close(struct server_ctx *ctx, int fd) {
-    struct conn_state *c = get_conn(fd);
+    struct conn_state *c = get_conn(ctx, fd);
     if (unlikely(!c))
         return false;
 
@@ -513,7 +527,7 @@ static inline bool queue_close(struct server_ctx *ctx, int fd) {
         return true;
 
     c->closing = 1;
-    idle_remove((u16)fd);
+    idle_remove(ctx, (u16)fd);
 
     // Phase 1: cancel active recv first
     if (c->recv_active && !c->cancel_sent) {
@@ -529,7 +543,7 @@ force_close:;
         LOG_ERROR("SQ full on close fd=%d, will retry on next sweep", fd);
         c->closing = 0;
         c->cancel_sent = 0;
-        idle_insert_expired((u16)fd);
+        idle_insert_expired(ctx, (u16)fd);
         return false;
     }
     prep_close_direct(sqe, fd);
@@ -547,9 +561,9 @@ static inline bool queue_setsockopt_nodelay(struct server_ctx *ctx, int fd) {
     return true;
 }
 
-static inline bool queue_send_zc(struct server_ctx *ctx, int fd,
+UNUSED static inline bool queue_send_zc(struct server_ctx *ctx, int fd,
                                   const void *data, u32 len) {
-    struct conn_state *c = get_conn(fd);
+    struct conn_state *c = get_conn(ctx, fd);
     if (unlikely(!c) || c->closing)
         return false;
 
@@ -612,12 +626,12 @@ static inline void handle_cancel(struct server_ctx *ctx,
     struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
     if (unlikely(!sqe)) {
         LOG_ERROR("SQ full on post-cancel close fd=%d, will retry on next sweep", fd);
-        struct conn_state *c = get_conn(fd);
+        struct conn_state *c = get_conn(ctx, fd);
         if (c) {
             c->closing = 0;
             c->cancel_sent = 0;
             c->recv_active = 0;  // cancel completed, recv is done
-            idle_insert_expired((u16)fd);
+            idle_insert_expired(ctx, (u16)fd);
         }
         return;
     }
@@ -628,11 +642,11 @@ static inline void handle_cancel(struct server_ctx *ctx,
 // (oldest) and stops at first non-expired node.
 static void sweep_idle_connections(struct server_ctx *ctx) {
     u64 now = rdtsc();
-    u16 idx = g_idle_list[0].next;  // head = oldest
+    u16 idx = ctx->idle_list[0].next;  // head = oldest
     while (idx != 0) {
-        if (now - g_last_activity[idx] < g_idle_timeout_ticks)
+        if (now - ctx->last_activity[idx] < ctx->idle_timeout_ticks)
             break;  // sorted by time — rest are newer
-        u16 next = g_idle_list[idx].next;
+        u16 next = ctx->idle_list[idx].next;
         queue_close(ctx, (int)idx);
         idx = next;
     }
@@ -656,13 +670,13 @@ static inline void handle_accept(struct server_ctx *ctx, struct io_uring_cqe *cq
     int idx = cqe->res;  // Fixed file INDEX, not fd
 
     if (likely(idx >= 0)) {
-        struct conn_state *c = get_conn(idx);  // idx used as connection ID
+        struct conn_state *c = get_conn(ctx, idx);  // idx used as connection ID
         if (likely(c)) {
             c->closing = 0;
             c->recv_active = 0;
             c->cancel_sent = 0;
             c->in_idle = 0;
-            idle_touch((u16)idx);
+            idle_touch(ctx, (u16)idx);
 
             // Async TCP_NODELAY via io_uring - kernel resolves fixed file internally
             queue_setsockopt_nodelay(ctx, idx);
@@ -686,7 +700,7 @@ static inline void handle_accept(struct server_ctx *ctx, struct io_uring_cqe *cq
 }
 
 static inline void handle_recv(struct server_ctx *ctx, struct io_uring_cqe *cqe, int fd) {
-    struct conn_state *c = get_conn(fd);
+    struct conn_state *c = get_conn(ctx, fd);
     int res = cqe->res;
     bool more = (cqe->flags & IORING_CQE_F_MORE) != 0;
 
@@ -707,7 +721,7 @@ static inline void handle_recv(struct server_ctx *ctx, struct io_uring_cqe *cqe,
         return;
     }
 
-    idle_touch((u16)fd);
+    idle_touch(ctx, (u16)fd);
 
     if (unlikely(!(cqe->flags & IORING_CQE_F_BUFFER))) {
         LOG_BUG("no buffer flag fd=%d", fd);
@@ -733,8 +747,8 @@ static inline void handle_recv(struct server_ctx *ctx, struct io_uring_cqe *cqe,
     }
 }
 
-static inline void handle_close(int fd) {
-    struct conn_state *c = get_conn(fd);
+static inline void handle_close(struct server_ctx *ctx, int fd) {
+    struct conn_state *c = get_conn(ctx, fd);
     if (c) {
         c->closing = 0;
         c->recv_active = 0;
@@ -781,18 +795,9 @@ static void event_loop(struct server_ctx *ctx) {
         return;
     }
 
-    // Detect TSC frequency and precompute idle threshold
-    u64 tsc_freq = detect_tsc_freq();
-    if (unlikely(!tsc_freq)) {
-        LOG_FATAL("CPUID: cannot determine TSC frequency");
-        return;
-    }
-    g_idle_timeout_ticks = (u64)IDLE_TIMEOUT_SEC * tsc_freq;
-
-    // BSS arrays (g_last_activity, g_idle_list, g_conns) are zero-initialized
-    // by the kernel's ELF loader — no explicit zero needed.  Avoiding
-    // mem_zero_aligned keeps pages demand-faulted (RSS proportional to
-    // active connections, not MAX_CONNECTIONS).
+    // Connection state arrays are zero-initialized:
+    // - Non-MULTICORE: BSS arrays zeroed by kernel ELF loader
+    // - MULTICORE: mmap'd with MAP_ANONYMOUS (zeroed by kernel)
     // Sentinel (idx 0) is zero-initialized: prev=0, next=0 = empty circular list
 
     if (unlikely(!queue_timeout_sweep(ctx))) {
@@ -813,7 +818,7 @@ static void event_loop(struct server_ctx *ctx) {
     // Cache CQ head - we're the only writer, no need to re-read from shared memory
     u32 head = *cq->khead;
 
-    while (likely(ctx->running)) {
+    while (likely(ctx->running && !g_shutdown)) {
         int ret = uring_submit_and_wait(&ctx->ring, 1, &ts);
         if (unlikely(ret < 0 && ret != -ETIME && ret != -EINTR)) {
             LOG_FATAL("submit_and_wait: %d", ret);
@@ -865,7 +870,7 @@ static void event_loop(struct server_ctx *ctx) {
                 break;
             }
             case OP_CLOSE:
-                handle_close(fd);
+                handle_close(ctx, fd);
                 break;
             case OP_SETSOCKOPT:
                 handle_setsockopt(ctx, cqe, fd);
@@ -915,35 +920,15 @@ static void event_loop(struct server_ctx *ctx) {
     LOG_INFO("Event loop exiting");
 }
 
-int server_run(u16 port, int cpu) {
-#ifdef DEBUG
-    _fmt_write(2, "=== DEBUG BUILD - NOT FOR PRODUCTION ===\n");
-#endif
-
-    LOG_INFO("io_uring server starting - port=%d cpu=%d sq=%d cq=%d bufs=%dx%d",
-             port, cpu, SQ_ENTRIES, CQ_ENTRIES, NUM_BUFFERS, BUFFER_SIZE);
-
-    if (set_cpu_affinity(cpu) < 0) {
-        LOG_WARN("Failed to set CPU affinity");
-    }
-
-    struct server_ctx ctx = { .running = 1 };
-    g_ctx = &ctx;
-
-    if (k_sigaction(SIGINT, signal_handler) < 0)
-        LOG_WARN("sigaction(SIGINT) failed");
-    if (k_sigaction(SIGTERM, signal_handler) < 0)
-        LOG_WARN("sigaction(SIGTERM) failed");
-
-    // Initialize SEND template with runtime address
-    SQE_TEMPLATE_SEND.addr = (u64)HTTP_200_RESPONSE;
-
-    int ret = uring_init(&ctx.ring, SQ_ENTRIES, CQ_ENTRIES);
+// Common server setup: io_uring, buffer rings, listen socket, event loop, cleanup.
+// Called by server_run (single-threaded) and server_run_worker (multicore).
+static int server_setup_and_run(struct server_ctx *ctx, u16 port, int cpu) {
+    int ret = uring_init(&ctx->ring, SQ_ENTRIES, CQ_ENTRIES);
     if (ret < 0) {
         LOG_FATAL("io_uring init: %d", ret);
         return 1;
     }
-    LOG_INFO("io_uring features: 0x%x", ctx.ring.features);
+    LOG_INFO("io_uring features: 0x%x", ctx->ring.features);
 
     // Initialize unified buffer ring manager
     struct buf_ring_config configs[] = {
@@ -955,30 +940,30 @@ int server_run(u16 port, int cpu) {
           .buffer_shift = ZC_BUFFER_SHIFT, .bgid = ZC_BUFFER_GROUP_ID,
           .flags = BRC_FLAG_ZC },
     };
-    ret = buf_ring_mgr_init(&ctx.ring, &ctx.br_mgr, configs,
+    ret = buf_ring_mgr_init(&ctx->ring, &ctx->br_mgr, configs,
                              sizeof(configs)/sizeof(configs[0]));
     if (ret < 0) {
         LOG_FATAL("buffer ring manager init: %d", ret);
         return 1;
     }
-    ctx.recv_grp = &ctx.br_mgr.groups[0];
+    ctx->recv_grp = &ctx->br_mgr.groups[0];
     // Probe for ZC support - set zc_grp to NULL if not available
-    ret = buf_ring_zc_probe(&ctx.ring);
+    ret = buf_ring_zc_probe(&ctx->ring);
     if (ret == 0) {
-        ctx.zc_grp = &ctx.br_mgr.groups[1];
+        ctx->zc_grp = &ctx->br_mgr.groups[1];
         LOG_INFO("Zerocopy send enabled");
     } else {
-        ctx.zc_grp = NULL;
+        ctx->zc_grp = NULL;
         LOG_INFO("Zerocopy send not available (ret=%d)", ret);
     }
 
     // Setup legacy buf_ring struct for hot path (points into br_mgr)
-    ctx.br.br = BUF_RING_PTR(&ctx.br_mgr, ctx.recv_grp);
-    ctx.br.buf_base = BUF_RING_DATA(&ctx.br_mgr, ctx.recv_grp);
-    ctx.br.tail = ctx.recv_grp->tail;
-    ctx.br.mask = ctx.recv_grp->mask;
-    ctx.br.buffer_size = ctx.recv_grp->buffer_size;
-    ctx.br.buffer_shift = ctx.recv_grp->buffer_shift;
+    ctx->br.br = BUF_RING_PTR(&ctx->br_mgr, ctx->recv_grp);
+    ctx->br.buf_base = BUF_RING_DATA(&ctx->br_mgr, ctx->recv_grp);
+    ctx->br.tail = ctx->recv_grp->tail;
+    ctx->br.mask = ctx->recv_grp->mask;
+    ctx->br.buffer_size = ctx->recv_grp->buffer_size;
+    ctx->br.buffer_shift = ctx->recv_grp->buffer_shift;
 
     int listen_fd = create_listen_socket(port, cpu);
     if (listen_fd < 0) {
@@ -986,7 +971,7 @@ int server_run(u16 port, int cpu) {
     }
 
     // Register fixed file table for direct accept
-    ret = uring_register_fixed_files(&ctx.ring, MAX_CONNECTIONS);
+    ret = uring_register_fixed_files(&ctx->ring, MAX_CONNECTIONS);
     if (ret < 0) {
         LOG_FATAL("fixed file registration: %d", ret);
         close(listen_fd);
@@ -1000,7 +985,7 @@ int server_run(u16 port, int cpu) {
         .offset = 0,
         .fds = (u64)(uintptr_t)install_fds,
     };
-    ret = io_uring_register(ctx.ring.ring_fd, IORING_REGISTER_FILES_UPDATE, &update, 1);
+    ret = io_uring_register(ctx->ring.ring_fd, IORING_REGISTER_FILES_UPDATE, &update, 1);
     if (ret < 0) {
         LOG_FATAL("listen socket install: %d", ret);
         close(listen_fd);
@@ -1009,24 +994,200 @@ int server_run(u16 port, int cpu) {
 
     // Close the original fd - fixed file table has the reference now
     close(listen_fd);
-    ctx.listen_fd = 0;  // Now this is the fixed file index
+    ctx->listen_fd = 0;  // Now this is the fixed file index
 
     LOG_INFO("Listening on port %d (fixed file index 0)", port);
 
-    event_loop(&ctx);
+    event_loop(ctx);
 
     // Cleanup buffer ring manager (unregisters from kernel, single munmap)
-    buf_ring_mgr_destroy(&ctx.ring, &ctx.br_mgr);
+    buf_ring_mgr_destroy(&ctx->ring, &ctx->br_mgr);
 
     // Unregister ring fd slot (if registered) before closing
-    if (ctx.ring.registered_index >= 0) {
+    if (ctx->ring.registered_index >= 0) {
         struct io_uring_rsrc_update up = {
-            .offset = (u32)ctx.ring.registered_index,
+            .offset = (u32)ctx->ring.registered_index,
         };
-        io_uring_register(ctx.ring.ring_fd, IORING_UNREGISTER_RING_FDS, &up, 1);
+        io_uring_register(ctx->ring.ring_fd, IORING_UNREGISTER_RING_FDS, &up, 1);
     }
-    close(ctx.ring.ring_fd);
+    close(ctx->ring.ring_fd);
 
     LOG_INFO("Server stopped");
     return 0;
 }
+
+int server_run(u16 port, int cpu) {
+#ifdef DEBUG
+    _fmt_write(2, "=== DEBUG BUILD - NOT FOR PRODUCTION ===\n");
+#endif
+
+    LOG_INFO("io_uring server starting - port=%d cpu=%d sq=%d cq=%d bufs=%dx%d",
+             port, cpu, SQ_ENTRIES, CQ_ENTRIES, NUM_BUFFERS, BUFFER_SIZE);
+
+    if (set_cpu_affinity(cpu) < 0) {
+        LOG_WARN("Failed to set CPU affinity");
+    }
+
+    struct server_ctx ctx = { .running = 1 };
+
+    if (k_sigaction(SIGINT, signal_handler) < 0)
+        LOG_WARN("sigaction(SIGINT) failed");
+    if (k_sigaction(SIGTERM, signal_handler) < 0)
+        LOG_WARN("sigaction(SIGTERM) failed");
+
+    // Initialize SEND template with runtime address
+    SQE_TEMPLATE_SEND.addr = (u64)HTTP_200_RESPONSE;
+
+    // Detect TSC frequency and precompute idle threshold
+    u64 tsc_freq = detect_tsc_freq();
+    if (unlikely(!tsc_freq)) {
+        LOG_FATAL("CPUID: cannot determine TSC frequency");
+        return 1;
+    }
+    ctx.idle_timeout_ticks = (u64)IDLE_TIMEOUT_SEC * tsc_freq;
+
+#ifndef MULTICORE
+    ctx.conns = g_conns;
+    ctx.idle_list = g_idle_list;
+    ctx.last_activity = g_last_activity;
+#endif
+
+    return server_setup_and_run(&ctx, port, cpu);
+}
+
+#ifdef MULTICORE
+
+#define WORKER_STACK_SIZE (64 * 1024)  // 64 KB
+
+#define CLONE_FLAGS (CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | \
+                     CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID)
+
+struct worker_info {
+    u32 tid_futex;    // kernel writes TID here, clears to 0 on thread exit
+    void *stack;      // mmap'd stack (WORKER_STACK_SIZE)
+    void *data;       // mmap'd worker_data (832 KB)
+};
+
+struct worker_args {
+    u16 port;
+    int cpu;
+    int worker_id;
+    u64 idle_timeout_ticks;
+    struct worker_data *data;
+};
+
+static void worker_main(void *arg) {
+    struct worker_args *wa = (struct worker_args *)arg;
+
+    if (set_cpu_affinity(wa->cpu) < 0)
+        LOG_WARN("Worker %d: failed to set CPU affinity to %d", wa->worker_id, wa->cpu);
+
+    struct server_ctx ctx = { .running = 1 };
+    struct worker_data *wd = wa->data;
+    ctx.conns = wd->conns;
+    ctx.idle_list = wd->idle_list;
+    ctx.last_activity = wd->last_activity;
+    ctx.idle_timeout_ticks = wa->idle_timeout_ticks;
+
+    LOG_INFO("Worker %d starting on CPU %d", wa->worker_id, wa->cpu);
+
+    server_setup_and_run(&ctx, wa->port, wa->cpu);
+    // thread_create trampoline calls sys_exit(0)
+}
+
+int server_start(u16 port, int cpu_start, int num_workers) {
+#ifdef DEBUG
+    _fmt_write(2, "=== DEBUG BUILD - NOT FOR PRODUCTION ===\n");
+#endif
+
+    if (num_workers < 1) num_workers = 1;
+    if (num_workers > MAX_WORKERS) num_workers = MAX_WORKERS;
+
+    // One-time global init (before any threads)
+    SQE_TEMPLATE_SEND.addr = (u64)HTTP_200_RESPONSE;
+
+    u64 tsc_freq = detect_tsc_freq();
+    if (!tsc_freq) {
+        LOG_FATAL("CPUID: cannot determine TSC frequency");
+        return 1;
+    }
+    u64 idle_ticks = (u64)IDLE_TIMEOUT_SEC * tsc_freq;
+
+    // Install signal handlers
+    if (k_sigaction(SIGINT, signal_handler) < 0)
+        LOG_WARN("sigaction(SIGINT) failed");
+    if (k_sigaction(SIGTERM, signal_handler) < 0)
+        LOG_WARN("sigaction(SIGTERM) failed");
+
+    // Stride 2: skip HT siblings — one worker per physical core
+    // e.g. cpu_start=4, 4 workers → CPUs 4, 6, 8, 10
+    LOG_INFO("Starting %d worker(s) on CPUs %d,%d,...,%d (stride 2)",
+             num_workers, cpu_start, cpu_start + 2,
+             cpu_start + (num_workers - 1) * 2);
+
+    struct worker_info workers[MAX_WORKERS] = {0};
+    struct worker_args args[MAX_WORKERS];
+
+    int spawned = 0;
+    int rc = 0;
+    for (int i = 0; i < num_workers; i++) {
+        // mmap stack
+        workers[i].stack = mmap(NULL, WORKER_STACK_SIZE,
+                                PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+        if (workers[i].stack == MAP_FAILED) {
+            LOG_FATAL("mmap stack for worker %d", i);
+            rc = 1;
+            break;
+        }
+
+        // mmap worker data (conns + idle_list + last_activity)
+        workers[i].data = mmap(NULL, sizeof(struct worker_data),
+                               PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (workers[i].data == MAP_FAILED) {
+            LOG_FATAL("mmap data for worker %d", i);
+            rc = 1;
+            break;
+        }
+
+        args[i] = (struct worker_args){
+            .port = port,
+            .cpu = cpu_start + i * 2,
+            .worker_id = i,
+            .idle_timeout_ticks = idle_ticks,
+            .data = (struct worker_data *)workers[i].data,
+        };
+
+        void *stack_top = (char *)workers[i].stack + WORKER_STACK_SIZE;
+        long tid = thread_create(CLONE_FLAGS, stack_top,
+                                 &workers[i].tid_futex,
+                                 worker_main, &args[i]);
+        if (tid < 0) {
+            LOG_FATAL("clone() failed for worker %d: %ld", i, tid);
+            rc = 1;
+            break;
+        }
+        spawned++;
+    }
+
+    // On spawn failure, signal running workers to stop
+    if (rc)
+        g_shutdown = 1;
+
+    // Wait for all spawned workers to exit before unmapping their memory
+    for (int i = 0; i < spawned; i++) {
+        while (__atomic_load_n(&workers[i].tid_futex, __ATOMIC_ACQUIRE) != 0)
+            sys_futex_wait(&workers[i].tid_futex, workers[i].tid_futex);
+    }
+
+    for (int i = 0; i < num_workers; i++) {
+        if (workers[i].stack && workers[i].stack != MAP_FAILED)
+            munmap(workers[i].stack, WORKER_STACK_SIZE);
+        if (workers[i].data && workers[i].data != MAP_FAILED)
+            munmap(workers[i].data, sizeof(struct worker_data));
+    }
+    return rc;
+}
+
+#endif // MULTICORE

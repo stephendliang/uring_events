@@ -221,6 +221,78 @@ static inline int k_sigaction(int sig, void (*handler)(int)) {
     return sys_rt_sigaction(sig, &sa, NULL, sizeof(k_sigset_t));
 }
 
+// === Multicore thread primitives ===
+#ifdef MULTICORE
+
+#include <linux/sched.h>
+
+// Thread-only exit (does NOT kill process group)
+__attribute__((unused)) static inline _Noreturn void sys_exit(int status) {
+    _syscall1(__NR_exit, status);
+    __builtin_unreachable();
+}
+
+// Futex — main thread waits for worker exit
+#define FUTEX_WAIT 0
+__attribute__((unused)) static inline long sys_futex_wait(u32 *addr, u32 expected) {
+    return _syscall6(__NR_futex, (long)addr, FUTEX_WAIT, expected, 0, 0, 0);
+}
+
+// Raw clone() syscall 56 + child trampoline.
+// Lowest-level thread creation on Linux — pure register args, no struct.
+//
+// C signature: thread_create(flags, stack_top, child_tid, fn, arg)
+//   rdi = clone flags
+//   rsi = child stack top (highest address — x86-64 stacks grow down)
+//   rdx = child_tid pointer (for CLONE_CHILD_SETTID / CLONE_CHILD_CLEARTID)
+//   rcx = fn (function pointer)
+//   r8  = arg (void *)
+//
+// Parent returns child TID (>0). Child calls fn(arg), then sys_exit(0).
+// fn/arg saved in callee-preserved r12/r13 BEFORE syscall; child inherits
+// identical register state on new stack.
+//
+// Syscall register mapping (differs from C ABI):
+//   rdi = flags, rsi = child_stack, rdx = parent_tid, r10 = child_tid, r8 = tls
+__attribute__((naked, noinline, unused))
+static long thread_create(unsigned long flags, void *stack_top,
+                           u32 *child_tid,
+                           void (*fn)(void *), void *arg) {
+    __asm__ volatile (
+        "push %%r12\n\t"
+        "push %%r13\n\t"
+        "mov  %%rcx, %%r12\n\t"     // r12 = fn (4th C arg in rcx)
+        "mov  %%r8,  %%r13\n\t"     // r13 = arg (5th C arg in r8)
+        // Remap C args → syscall convention:
+        // rdi = flags         (already correct)
+        // rsi = child_stack   (already correct)
+        // rdx → r10 = child_tid, then rdx = parent_tid = NULL
+        "mov  %%rdx, %%r10\n\t"     // r10 = child_tid
+        "xor  %%edx, %%edx\n\t"     // rdx = parent_tid = NULL
+        "xor  %%r8d, %%r8d\n\t"     // r8 = tls = 0 (no TLS)
+        "mov  $56, %%eax\n\t"       // __NR_clone
+        "syscall\n\t"
+        "test %%rax, %%rax\n\t"
+        "jnz  1f\n\t"
+        // --- child (new stack, same registers) ---
+        "xor  %%ebp, %%ebp\n\t"
+        "mov  %%r13, %%rdi\n\t"     // arg
+        "call *%%r12\n\t"           // fn(arg)
+        "mov  %%eax, %%edi\n\t"
+        "mov  $60, %%eax\n\t"       // __NR_exit (thread only)
+        "syscall\n\t"
+        "ud2\n\t"
+        // --- parent ---
+        "1:\n\t"
+        "pop  %%r13\n\t"
+        "pop  %%r12\n\t"
+        "ret"
+        ::: "memory"
+    );
+}
+
+#endif // MULTICORE
+
 // Minimal stderr formatter
 
 // Handles: %s %d %u %x %zu %p (and %% for literal %).

@@ -35,5 +35,14 @@ int main(int argc, char *argv[]) {
         if (cpu < 0) return 1;
     }
 
+#ifdef MULTICORE
+    int workers = 1;
+    if (argc > 3) {
+        workers = parse_int(argv[3], 1, MAX_WORKERS, "workers");
+        if (workers < 0) return 1;
+    }
+    return server_start(port, cpu, workers);
+#else
     return server_run(port, cpu);
+#endif
 }
