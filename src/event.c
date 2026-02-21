@@ -60,6 +60,11 @@ enum op_type {
     OP_CLOSE      = 3,
     OP_SETSOCKOPT = 4,
     OP_SEND_ZC    = 5,
+#ifdef FILE_IO
+    OP_FILE_READ  = 6,
+    OP_FILE_WRITE = 7,
+    OP_FILE_FSYNC = 8,
+#endif
 };
 
 // Pre-shifted operation codes for faster encoding
@@ -69,6 +74,12 @@ enum op_type {
 #define OP_CLOSE_SHIFTED      ((u64)OP_CLOSE << 32)
 #define OP_SETSOCKOPT_SHIFTED ((u64)OP_SETSOCKOPT << 32)
 #define OP_SEND_ZC_SHIFTED    ((u64)OP_SEND_ZC << 32)
+
+#ifdef FILE_IO
+#define OP_FILE_READ_SHIFTED  ((u64)OP_FILE_READ << 32)
+#define OP_FILE_WRITE_SHIFTED ((u64)OP_FILE_WRITE << 32)
+#define OP_FILE_FSYNC_SHIFTED ((u64)OP_FILE_FSYNC << 32)
+#endif
 
 // SQE templates — 64-byte aligned for SIMD copy, fd/user_data patched per-op
 #define CACHE_ALIGN __attribute__((aligned(64)))
@@ -194,6 +205,44 @@ static inline void prep_setsockopt_direct(struct io_uring_sqe *sqe, int idx,
     *(u32 *)(cmd + 8) = (u32)optlen;
     *(u64 *)(cmd + 16) = (u64)(uintptr_t)optval;
 }
+
+#ifdef FILE_IO
+static inline void prep_file_read(struct io_uring_sqe *sqe,
+                                   int fd, void *buf, u32 len,
+                                   u64 offset, u64 user_data) {
+    mem_zero_cacheline(sqe);
+    sqe->opcode    = IORING_OP_READ;
+    sqe->flags     = IOSQE_FIXED_FILE;
+    sqe->fd        = fd;
+    sqe->off       = offset;
+    sqe->addr      = (u64)(uintptr_t)buf;
+    sqe->len       = len;
+    sqe->user_data = user_data;
+}
+
+static inline void prep_file_write(struct io_uring_sqe *sqe,
+                                    int fd, const void *buf, u32 len,
+                                    u64 offset, u64 user_data) {
+    mem_zero_cacheline(sqe);
+    sqe->opcode    = IORING_OP_WRITE;
+    sqe->flags     = IOSQE_FIXED_FILE;
+    sqe->fd        = fd;
+    sqe->off       = offset;
+    sqe->addr      = (u64)(uintptr_t)buf;
+    sqe->len       = len;
+    sqe->user_data = user_data;
+}
+
+static inline void prep_file_fsync(struct io_uring_sqe *sqe,
+                                    int fd, u64 user_data) {
+    mem_zero_cacheline(sqe);
+    sqe->opcode      = IORING_OP_FSYNC;
+    sqe->flags       = IOSQE_FIXED_FILE;
+    sqe->fd          = fd;
+    sqe->user_data   = user_data;
+    sqe->fsync_flags = IORING_FSYNC_DATASYNC;
+}
+#endif
 
 // Listening socket setup (startup path - not performance critical)
 static int create_listen_socket(u16 port, int cpu) {
@@ -492,6 +541,35 @@ static inline void handle_close(int fd) {
     }
 }
 
+#ifdef FILE_IO
+static inline void handle_file_read(struct server_ctx *ctx,
+                                     struct io_uring_cqe *cqe, int fd) {
+    (void)ctx; (void)fd;
+    int res = cqe->res;
+    if (unlikely(res < 0))
+        LOG_ERROR("file read error %d fd=%d", res, fd);
+    // TODO: wire to response pipeline
+}
+
+static inline void handle_file_write(struct server_ctx *ctx,
+                                      struct io_uring_cqe *cqe, int fd) {
+    (void)ctx; (void)fd;
+    int res = cqe->res;
+    if (unlikely(res < 0))
+        LOG_ERROR("file write error %d fd=%d", res, fd);
+    // TODO: wire to persistence pipeline
+}
+
+static inline void handle_file_fsync(struct server_ctx *ctx,
+                                      struct io_uring_cqe *cqe, int fd) {
+    (void)ctx; (void)fd;
+    int res = cqe->res;
+    if (unlikely(res < 0))
+        LOG_ERROR("file fsync error %d fd=%d", res, fd);
+    // TODO: wire to durability callback
+}
+#endif
+
 // Main event loop
 static void event_loop(struct server_ctx *ctx) {
     struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 };  // 1ms
@@ -574,6 +652,17 @@ static void event_loop(struct server_ctx *ctx) {
             case OP_SEND_ZC:
                 handle_send_zc(ctx, cqe, fd);
                 break;
+#ifdef FILE_IO
+            case OP_FILE_READ:
+                handle_file_read(ctx, cqe, fd);
+                break;
+            case OP_FILE_WRITE:
+                handle_file_write(ctx, cqe, fd);
+                break;
+            case OP_FILE_FSYNC:
+                handle_file_fsync(ctx, cqe, fd);
+                break;
+#endif
             default:
                 LOG_BUG("unknown op %u", op);
                 break;
