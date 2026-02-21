@@ -142,6 +142,27 @@ static const struct io_uring_sqe SQE_TEMPLATE_SEND_ZC = {
     .buf_group = ZC_BUFFER_GROUP_ID,
 };
 
+#ifdef FILE_IO
+CACHE_ALIGN UNUSED
+static const struct io_uring_sqe SQE_TEMPLATE_FILE_READ = {
+    .opcode = IORING_OP_READ,
+    .flags  = IOSQE_FIXED_FILE,
+};
+
+CACHE_ALIGN UNUSED
+static const struct io_uring_sqe SQE_TEMPLATE_FILE_WRITE = {
+    .opcode = IORING_OP_WRITE,
+    .flags  = IOSQE_FIXED_FILE,
+};
+
+CACHE_ALIGN UNUSED
+static const struct io_uring_sqe SQE_TEMPLATE_FILE_FSYNC = {
+    .opcode      = IORING_OP_FSYNC,
+    .flags       = IOSQE_FIXED_FILE,
+    .fsync_flags = IORING_FSYNC_DATASYNC,
+};
+#endif
+
 // Connection state - bit-packed for cache efficiency
 struct conn_state {
     u8 closing : 1;
@@ -207,41 +228,14 @@ static inline void prep_setsockopt_direct(struct io_uring_sqe *sqe, int idx,
 }
 
 #ifdef FILE_IO
-static inline void prep_file_read(struct io_uring_sqe *sqe,
-                                   int fd, void *buf, u32 len,
-                                   u64 offset, u64 user_data) {
-    mem_zero_cacheline(sqe);
-    sqe->opcode    = IORING_OP_READ;
-    sqe->flags     = IOSQE_FIXED_FILE;
-    sqe->fd        = fd;
-    sqe->off       = offset;
-    sqe->addr      = (u64)(uintptr_t)buf;
-    sqe->len       = len;
-    sqe->user_data = user_data;
-}
+#define prep_file_read_direct(sqe, fd, buf, len, off, ud) \
+    PREP_SQE_FILE(sqe, SQE_TEMPLATE_FILE_READ, fd, off, (u64)(uintptr_t)(buf), len, ud)
 
-static inline void prep_file_write(struct io_uring_sqe *sqe,
-                                    int fd, const void *buf, u32 len,
-                                    u64 offset, u64 user_data) {
-    mem_zero_cacheline(sqe);
-    sqe->opcode    = IORING_OP_WRITE;
-    sqe->flags     = IOSQE_FIXED_FILE;
-    sqe->fd        = fd;
-    sqe->off       = offset;
-    sqe->addr      = (u64)(uintptr_t)buf;
-    sqe->len       = len;
-    sqe->user_data = user_data;
-}
+#define prep_file_write_direct(sqe, fd, buf, len, off, ud) \
+    PREP_SQE_FILE(sqe, SQE_TEMPLATE_FILE_WRITE, fd, off, (u64)(uintptr_t)(buf), len, ud)
 
-static inline void prep_file_fsync(struct io_uring_sqe *sqe,
-                                    int fd, u64 user_data) {
-    mem_zero_cacheline(sqe);
-    sqe->opcode      = IORING_OP_FSYNC;
-    sqe->flags       = IOSQE_FIXED_FILE;
-    sqe->fd          = fd;
-    sqe->user_data   = user_data;
-    sqe->fsync_flags = IORING_FSYNC_DATASYNC;
-}
+#define prep_file_fsync_direct(sqe, fd, ud) \
+    PREP_SQE(sqe, SQE_TEMPLATE_FILE_FSYNC, fd, ud)
 #endif
 
 // Listening socket setup (startup path - not performance critical)

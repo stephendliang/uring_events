@@ -21,3 +21,4 @@
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #define prefetch_r(addr) __builtin_prefetch((addr), 0, 3)
+#define UNUSED __attribute__((unused))
