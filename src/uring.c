@@ -311,7 +311,6 @@ int buf_ring_zc_probe(struct uring *ring) {
         return -ENOMEM;
 
     mem_zero_aligned(probe, alloc_size);
-    probe->last_op = 255;
 
     int ret = io_uring_register(ring->ring_fd, IORING_REGISTER_PROBE, probe, 256);
     if (ret < 0) {

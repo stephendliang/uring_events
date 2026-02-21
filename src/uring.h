@@ -31,11 +31,11 @@
 
 // Zerocopy constants (kernel 6.10+)
 #ifndef IORING_OP_SEND_ZC
-#define IORING_OP_SEND_ZC 53
+#define IORING_OP_SEND_ZC 47
 #endif
 
 #ifndef IORING_RECVSEND_BUNDLE
-#define IORING_RECVSEND_BUNDLE (1U << 1)
+#define IORING_RECVSEND_BUNDLE (1U << 4)
 #endif
 
 #ifndef IORING_CQE_F_NOTIF

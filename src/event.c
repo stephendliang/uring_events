@@ -135,6 +135,9 @@ static const struct io_uring_sqe SQE_TEMPLATE_CLOSE = {
 #ifndef ZC_BUFFER_SHIFT
 #define ZC_BUFFER_SHIFT         12  // log2(ZC_BUFFER_SIZE)
 #endif
+#ifndef ZC_MAX_INFLIGHT
+#define ZC_MAX_INFLIGHT         256 // Per-worker cap to avoid kernel ENOMEM
+#endif
 
 _Static_assert((ZC_NUM_BUFFERS & (ZC_NUM_BUFFERS - 1)) == 0,
                "ZC_NUM_BUFFERS must be power of 2");
@@ -142,18 +145,17 @@ _Static_assert((1 << ZC_BUFFER_SHIFT) == ZC_BUFFER_SIZE,
                "ZC_BUFFER_SHIFT must match ZC_BUFFER_SIZE");
 
 CACHE_ALIGN
-static const struct io_uring_sqe SQE_TEMPLATE_SEND_ZC = {
-    .opcode    = IORING_OP_SEND_ZC,
-    .flags     = IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT,
-    .ioprio    = IORING_RECVSEND_BUNDLE,
-    .buf_group = ZC_BUFFER_GROUP_ID,
+static struct io_uring_sqe SQE_TEMPLATE_SEND_ZC = { // non-const: addr set at init
+    .opcode = IORING_OP_SEND_ZC,
+    .flags  = IOSQE_FIXED_FILE,
+    .len    = HTTP_200_LEN,
 };
 
 static struct __kernel_timespec g_sweep_interval = {
     .tv_sec = SWEEP_INTERVAL_SEC, .tv_nsec = 0,
 };
 
-CACHE_ALIGN UNUSED
+CACHE_ALIGN
 static const struct io_uring_sqe SQE_TEMPLATE_TIMEOUT = {
     .opcode        = IORING_OP_TIMEOUT,
     .fd            = -1,
@@ -162,7 +164,7 @@ static const struct io_uring_sqe SQE_TEMPLATE_TIMEOUT = {
     .user_data     = OP_TIMEOUT_SHIFTED | 0xFFFFFFFF,
 };
 
-CACHE_ALIGN UNUSED
+CACHE_ALIGN
 static const struct io_uring_sqe SQE_TEMPLATE_CANCEL = {
     .opcode = IORING_OP_ASYNC_CANCEL,
     .fd     = -1,
@@ -227,7 +229,8 @@ struct server_ctx {
     struct buf_ring br;              // 32 bytes, buffer recycling
     sig_atomic_t running;            // +32: Loop condition
     int listen_fd;                   // +36: Moved here to eliminate padding hole
-    u8 _pad_hot[24];                 // +40: Pad to 64 bytes
+    u32 zc_inflight;                 // +40: In-flight ZC sends awaiting NOTIF
+    u8 _pad_hot[20];                 // +44: Pad to 64 bytes
 
     // === WARM: accessed per batch ===
     struct uring ring;               // SQ/CQ access
@@ -334,8 +337,8 @@ static inline void prep_close_direct(struct io_uring_sqe *sqe, int fd) {
     sqe->file_index = (u32)fd + 1;
 }
 
-#define prep_send_zc_direct(sqe, fd, buf_idx) \
-    PREP_SQE(sqe, SQE_TEMPLATE_SEND_ZC, fd, OP_SEND_ZC_SHIFTED | (u32)(fd) | ((u64)(buf_idx) << 40))
+#define prep_send_zc_direct(sqe, fd) \
+    PREP_SQE(sqe, SQE_TEMPLATE_SEND_ZC, fd, OP_SEND_ZC_SHIFTED | (u32)(fd))
 
 // SETSOCKOPT: SIMD zero + scalar patches. SQEs are 64-byte aligned.
 static inline void prep_setsockopt_direct(struct io_uring_sqe *sqe, int idx,
@@ -561,24 +564,10 @@ static inline bool queue_setsockopt_nodelay(struct server_ctx *ctx, int fd) {
     return true;
 }
 
-UNUSED static inline bool queue_send_zc(struct server_ctx *ctx, int fd,
-                                  const void *data, u32 len) {
+static inline bool queue_send_zc(struct server_ctx *ctx, int fd) {
     struct conn_state *c = get_conn(ctx, fd);
     if (unlikely(!c) || c->closing)
         return false;
-
-    u16 buf_idx = buf_ring_zc_alloc(ctx->zc_grp);
-    if (unlikely(buf_idx == UINT16_MAX)) {
-        LOG_WARN("zc: no buffers fd=%d", fd);
-        return false;
-    }
-
-    void *buf = BUF_RING_ADDR(&ctx->br_mgr, ctx->zc_grp, buf_idx);
-    u32 copy_len = (len > ZC_BUFFER_SIZE) ? ZC_BUFFER_SIZE : len;
-    mem_copy_small(buf, data, copy_len);
-
-    buf_ring_zc_push(&ctx->br_mgr, ctx->zc_grp, buf_idx, copy_len);
-    buf_ring_mgr_sync(&ctx->br_mgr, ctx->zc_grp);
 
     struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
     if (unlikely(!sqe)) {
@@ -586,28 +575,46 @@ UNUSED static inline bool queue_send_zc(struct server_ctx *ctx, int fd,
         return false;
     }
 
-    prep_send_zc_direct(sqe, fd, buf_idx);
+    prep_send_zc_direct(sqe, fd);
+    ctx->zc_inflight++;
     return true;
 }
 
 static inline void handle_send_zc(struct server_ctx *ctx,
                                    struct io_uring_cqe *cqe, int fd) {
-    u16 buf_idx = decode_buf_idx(cqe->user_data);
-
     if (cqe->flags & IORING_CQE_F_NOTIF) {
-        // Notification: buffer safe to reuse
-        buf_ring_zc_recycle(ctx->zc_grp, buf_idx);
+        ctx->zc_inflight--;
         return;
     }
 
-    // Completion: send done, buffer still in-flight to NIC
+    // Non-NOTIF CQE without MORE flag = fallback regular send completion
+    if (!(cqe->flags & IORING_CQE_F_MORE)) {
+        // Regular send routed here (no NOTIF coming, no inflight to adjust)
+        if (unlikely(cqe->res < 0)) {
+            if (!is_benign_err(cqe->res))
+                LOG_ERROR("send fallback error %d fd=%d", cqe->res, fd);
+            queue_close(ctx, fd);
+        }
+        return;
+    }
+
+    // ZC completion (MORE set = NOTIF pending)
     int res = cqe->res;
     if (unlikely(res < 0)) {
+        ctx->zc_inflight--; // No NOTIF coming on error
+        if (res == -ENOMEM) {
+            // ZC notif allocation failed — fall back to regular send.
+            struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
+            if (likely(sqe)) {
+                PREP_SQE(sqe, SQE_TEMPLATE_SEND, fd,
+                         OP_SEND_ZC_SHIFTED | (u32)fd);
+                return;
+            }
+        }
         if (!is_benign_err(res))
             LOG_ERROR("zc send error %d fd=%d", res, fd);
         queue_close(ctx, fd);
     }
-    // Do NOT recycle - wait for NOTIF
 }
 
 static inline void handle_setsockopt(struct server_ctx *ctx,
@@ -737,9 +744,17 @@ static inline void handle_recv(struct server_ctx *ctx, struct io_uring_cqe *cqe,
         return;
     });
 
-    if (unlikely(!queue_send(ctx, fd, buf_idx))) {
-        queue_close(ctx, fd);
-        return;
+    if (ctx_zc_enabled(ctx) && ctx->zc_inflight < ZC_MAX_INFLIGHT) {
+        buf_ring_recycle(&ctx->br, buf_idx);
+        if (unlikely(!queue_send_zc(ctx, fd))) {
+            queue_close(ctx, fd);
+            return;
+        }
+    } else {
+        if (unlikely(!queue_send(ctx, fd, buf_idx))) {
+            queue_close(ctx, fd);
+            return;
+        }
     }
 
     if (unlikely(!more && c && !c->closing)) {
@@ -1035,8 +1050,9 @@ int server_run(u16 port, int cpu) {
     if (k_sigaction(SIGTERM, signal_handler) < 0)
         LOG_WARN("sigaction(SIGTERM) failed");
 
-    // Initialize SEND template with runtime address
+    // Initialize SEND templates with runtime address
     SQE_TEMPLATE_SEND.addr = (u64)HTTP_200_RESPONSE;
+    SQE_TEMPLATE_SEND_ZC.addr = (u64)HTTP_200_RESPONSE;
 
     // Detect TSC frequency and precompute idle threshold
     u64 tsc_freq = detect_tsc_freq();
@@ -1105,6 +1121,7 @@ int server_start(u16 port, int cpu_start, int num_workers) {
 
     // One-time global init (before any threads)
     SQE_TEMPLATE_SEND.addr = (u64)HTTP_200_RESPONSE;
+    SQE_TEMPLATE_SEND_ZC.addr = (u64)HTTP_200_RESPONSE;
 
     u64 tsc_freq = detect_tsc_freq();
     if (!tsc_freq) {
