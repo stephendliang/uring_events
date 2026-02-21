@@ -21,6 +21,7 @@ typedef int64_t  i64;
 #include <asm/unistd.h>
 #include <asm-generic/errno-base.h>
 #include <asm-generic/errno.h>
+#include <linux/time_types.h>
 #include <linux/mman.h>
 #include <asm-generic/mman-common.h>
 #include <asm-generic/socket.h>
@@ -161,6 +162,11 @@ static inline long sys_io_uring_enter(int fd, unsigned to_submit,
                                        const void *arg, size_t argsz) {
     return _syscall6(__NR_io_uring_enter, fd, to_submit, min_complete,
                      flags, (long)arg, argsz);
+}
+
+static inline int sys_clock_gettime(int clk_id,
+                                     struct __kernel_timespec *tp) {
+    return (int)_syscall2(__NR_clock_gettime, clk_id, tp);
 }
 
 static inline int sys_rt_sigaction(int sig, const struct k_sigaction *act,

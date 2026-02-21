@@ -27,8 +27,10 @@ enum {
     BUFFER_SIZE     = 2048,
     BUFFER_SHIFT    = 11,
     BUFFER_GROUP_ID = 0,
-    LISTEN_BACKLOG  = 4096,
-    MAX_CONNECTIONS = 65536,
+    LISTEN_BACKLOG     = 4096,
+    MAX_CONNECTIONS    = 65536,
+    IDLE_TIMEOUT_SEC   = 30,
+    SWEEP_INTERVAL_SEC = 5,
 };
 
 // Compile-time validation
@@ -65,6 +67,8 @@ enum op_type {
     OP_FILE_WRITE = 7,
     OP_FILE_FSYNC = 8,
 #endif
+    OP_CANCEL  = 9,
+    OP_TIMEOUT = 10,
 };
 
 // Pre-shifted operation codes for faster encoding
@@ -80,6 +84,9 @@ enum op_type {
 #define OP_FILE_WRITE_SHIFTED ((u64)OP_FILE_WRITE << 32)
 #define OP_FILE_FSYNC_SHIFTED ((u64)OP_FILE_FSYNC << 32)
 #endif
+
+#define OP_CANCEL_SHIFTED  ((u64)OP_CANCEL << 32)
+#define OP_TIMEOUT_SHIFTED ((u64)OP_TIMEOUT << 32)
 
 // SQE templates — 64-byte aligned for SIMD copy, fd/user_data patched per-op
 #define CACHE_ALIGN __attribute__((aligned(64)))
@@ -142,6 +149,25 @@ static const struct io_uring_sqe SQE_TEMPLATE_SEND_ZC = {
     .buf_group = ZC_BUFFER_GROUP_ID,
 };
 
+static struct __kernel_timespec g_sweep_interval = {
+    .tv_sec = SWEEP_INTERVAL_SEC, .tv_nsec = 0,
+};
+
+CACHE_ALIGN UNUSED
+static const struct io_uring_sqe SQE_TEMPLATE_TIMEOUT = {
+    .opcode        = IORING_OP_TIMEOUT,
+    .fd            = -1,
+    .len           = 0,
+    .timeout_flags = IORING_TIMEOUT_MULTISHOT,
+    .user_data     = OP_TIMEOUT_SHIFTED | 0xFFFFFFFF,
+};
+
+CACHE_ALIGN UNUSED
+static const struct io_uring_sqe SQE_TEMPLATE_CANCEL = {
+    .opcode = IORING_OP_ASYNC_CANCEL,
+    .fd     = -1,
+};
+
 #ifdef FILE_IO
 CACHE_ALIGN UNUSED
 static const struct io_uring_sqe SQE_TEMPLATE_FILE_READ = {
@@ -165,12 +191,59 @@ static const struct io_uring_sqe SQE_TEMPLATE_FILE_FSYNC = {
 
 // Connection state - bit-packed for cache efficiency
 struct conn_state {
-    u8 closing : 1;
+    u8 closing     : 1;
     u8 recv_active : 1;
-    u8 reserved : 6;
+    u8 cancel_sent : 1;
+    u8 in_idle     : 1;
+    u8 reserved    : 4;
 };
 
 CACHE_ALIGN static struct conn_state g_conns[MAX_CONNECTIONS];
+
+// Intrusive doubly-linked list for idle tracking (O(1) insert/remove/expire)
+// Index 0 = sentinel (listen socket, never idle-tracked).
+// Circular: sentinel.next = oldest, sentinel.prev = newest.
+struct idle_node {
+    u16 prev;
+    u16 next;
+};
+
+static struct idle_node g_idle_list[MAX_CONNECTIONS];  // 256 KB
+static u32 g_last_activity[MAX_CONNECTIONS];           // 256 KB
+static u64 g_start_sec;                                // CLOCK_MONOTONIC at startup
+static u32 g_cached_now;                               // updated on timer tick only
+
+// Unlink node from list. Caller must check in_idle first.
+static inline void idle_unlink(u16 idx) {
+    u16 p = g_idle_list[idx].prev;
+    u16 n = g_idle_list[idx].next;
+    g_idle_list[p].next = n;
+    g_idle_list[n].prev = p;
+}
+
+// Move/insert connection to tail (most recent). O(1).
+static inline void idle_touch(u16 idx, u32 now) {
+    struct conn_state *c = &g_conns[idx];
+    if (c->in_idle)
+        idle_unlink(idx);
+    // Insert before sentinel (= at tail)
+    u16 tail = g_idle_list[0].prev;
+    g_idle_list[idx].prev = tail;
+    g_idle_list[idx].next = 0;
+    g_idle_list[tail].next = idx;
+    g_idle_list[0].prev = idx;
+    c->in_idle = 1;
+    g_last_activity[idx] = now;
+}
+
+// Remove from list on close. O(1).
+static inline void idle_remove(u16 idx) {
+    struct conn_state *c = &g_conns[idx];
+    if (c->in_idle) {
+        idle_unlink(idx);
+        c->in_idle = 0;
+    }
+}
 
 // Static value for async setsockopt - must persist across async operation
 static int g_tcp_nodelay_val = 1;
@@ -237,6 +310,20 @@ static inline void prep_setsockopt_direct(struct io_uring_sqe *sqe, int idx,
 #define prep_file_fsync_direct(sqe, fd, ud) \
     PREP_SQE(sqe, SQE_TEMPLATE_FILE_FSYNC, fd, ud)
 #endif
+
+// Scalar prep for timeout sweep (cold path — submitted once at startup)
+static inline void prep_timeout_sweep(struct io_uring_sqe *sqe,
+                                       struct __kernel_timespec *ts) {
+    *sqe = SQE_TEMPLATE_TIMEOUT;
+    sqe->addr = (u64)(uintptr_t)ts;
+}
+
+// Scalar prep for cancel recv (close path — not hot)
+static inline void prep_cancel_recv(struct io_uring_sqe *sqe, int fd) {
+    *sqe = SQE_TEMPLATE_CANCEL;
+    sqe->addr      = OP_RECV_SHIFTED | (u32)fd;
+    sqe->user_data = OP_CANCEL_SHIFTED | (u32)fd;
+}
 
 // Listening socket setup (startup path - not performance critical)
 static int create_listen_socket(u16 port, int cpu) {
@@ -363,22 +450,52 @@ static inline bool queue_send(struct server_ctx *ctx, int fd, u16 buf_idx) {
     return true;
 }
 
+static inline bool queue_cancel_recv(struct server_ctx *ctx, int fd) {
+    struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
+    if (unlikely(!sqe)) {
+        LOG_ERROR("SQ full on cancel fd=%d", fd);
+        return false;
+    }
+    prep_cancel_recv(sqe, fd);
+    return true;
+}
+
+static inline bool queue_timeout_sweep(struct server_ctx *ctx) {
+    struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
+    if (unlikely(!sqe)) {
+        LOG_ERROR("SQ full on timeout");
+        return false;
+    }
+    prep_timeout_sweep(sqe, &g_sweep_interval);
+    return true;
+}
+
 static inline bool queue_close(struct server_ctx *ctx, int fd) {
     struct conn_state *c = get_conn(fd);
     if (unlikely(!c))
         return false;
 
     if (c->closing)
-        return true;  // Already queued
+        return true;
 
+    c->closing = 1;
+    idle_remove((u16)fd);
+
+    // Phase 1: cancel active recv first
+    if (c->recv_active && !c->cancel_sent) {
+        c->cancel_sent = 1;
+        if (unlikely(!queue_cancel_recv(ctx, fd)))
+            goto force_close;  // SQ full — close without cancel
+        return true;           // close issued in handle_cancel
+    }
+
+force_close:;
     struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
     if (unlikely(!sqe)) {
         LOG_ERROR("SQ full on close fd=%d", fd);
-        c->closing = 1;  // Mark to prevent further ops
         return false;
     }
     prep_close_direct(sqe, fd);
-    c->closing = 1;
     return true;
 }
 
@@ -451,6 +568,48 @@ static inline void handle_setsockopt(struct server_ctx *ctx,
     // TCP_NODELAY failure is non-fatal, connection proceeds
 }
 
+static inline void handle_cancel(struct server_ctx *ctx,
+                                  struct io_uring_cqe *cqe, int fd) {
+    (void)cqe;  // res: 0=cancelled, -ENOENT=not found, -EALREADY=completing
+    // All results lead to close — the recv is no longer producing CQEs
+    struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
+    if (unlikely(!sqe)) {
+        LOG_ERROR("SQ full on post-cancel close fd=%d", fd);
+        return;
+    }
+    prep_close_direct(sqe, fd);
+}
+
+// O(k) where k = number of expired connections. Walks LRU list from head
+// (oldest) and stops at first non-expired node.
+static void sweep_idle_connections(struct server_ctx *ctx) {
+    u32 now = g_cached_now;
+    u16 idx = g_idle_list[0].next;  // head = oldest
+    while (idx != 0) {
+        if (now - g_last_activity[idx] < IDLE_TIMEOUT_SEC)
+            break;  // sorted by time — rest are newer
+        u16 next = g_idle_list[idx].next;
+        queue_close(ctx, (int)idx);
+        idx = next;
+    }
+}
+
+static inline void handle_timeout(struct server_ctx *ctx,
+                                    struct io_uring_cqe *cqe) {
+    // Update cached clock (one syscall per tick, not per recv)
+    struct __kernel_timespec ts;
+    sys_clock_gettime(1 /* CLOCK_MONOTONIC */, &ts);
+    g_cached_now = (u32)((u64)ts.tv_sec - g_start_sec);
+
+    sweep_idle_connections(ctx);
+
+    // IORING_TIMEOUT_MULTISHOT: CQE has MORE flag if still armed
+    if (unlikely(!(cqe->flags & IORING_CQE_F_MORE))) {
+        LOG_WARN("multishot timeout disarmed, rearming");
+        queue_timeout_sweep(ctx);
+    }
+}
+
 static inline void handle_accept(struct server_ctx *ctx, struct io_uring_cqe *cqe) {
     int idx = cqe->res;  // Fixed file INDEX, not fd
 
@@ -459,6 +618,9 @@ static inline void handle_accept(struct server_ctx *ctx, struct io_uring_cqe *cq
         if (likely(c)) {
             c->closing = 0;
             c->recv_active = 0;
+            c->cancel_sent = 0;
+            c->in_idle = 0;
+            idle_touch((u16)idx, g_cached_now);
 
             // Async TCP_NODELAY via io_uring - kernel resolves fixed file internally
             queue_setsockopt_nodelay(ctx, idx);
@@ -503,6 +665,8 @@ static inline void handle_recv(struct server_ctx *ctx, struct io_uring_cqe *cqe,
         return;
     }
 
+    idle_touch((u16)fd, g_cached_now);
+
     if (unlikely(!(cqe->flags & IORING_CQE_F_BUFFER))) {
         LOG_BUG("no buffer flag fd=%d", fd);
         queue_close(ctx, fd);
@@ -532,6 +696,8 @@ static inline void handle_close(int fd) {
     if (c) {
         c->closing = 0;
         c->recv_active = 0;
+        c->cancel_sent = 0;
+        c->in_idle = 0;
     }
 }
 
@@ -570,6 +736,20 @@ static void event_loop(struct server_ctx *ctx) {
 
     if (unlikely(!queue_accept(ctx))) {
         LOG_FATAL("Failed to start accept");
+        return;
+    }
+
+    // Initialize idle tracking
+    struct __kernel_timespec init_ts;
+    sys_clock_gettime(1 /* CLOCK_MONOTONIC */, &init_ts);
+    g_start_sec = (u64)init_ts.tv_sec;
+    g_cached_now = 0;
+    mem_zero_aligned(g_last_activity, sizeof(g_last_activity));
+    mem_zero_aligned(g_idle_list, sizeof(g_idle_list));
+    // Sentinel (idx 0) is zero-initialized: prev=0, next=0 = empty circular list
+
+    if (unlikely(!queue_timeout_sweep(ctx))) {
+        LOG_FATAL("Failed to arm sweep timer");
         return;
     }
 
@@ -645,6 +825,12 @@ static void event_loop(struct server_ctx *ctx) {
                 break;
             case OP_SEND_ZC:
                 handle_send_zc(ctx, cqe, fd);
+                break;
+            case OP_CANCEL:
+                handle_cancel(ctx, cqe, fd);
+                break;
+            case OP_TIMEOUT:
+                handle_timeout(ctx, cqe);
                 break;
 #ifdef FILE_IO
             case OP_FILE_READ:

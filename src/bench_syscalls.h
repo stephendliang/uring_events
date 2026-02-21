@@ -7,7 +7,7 @@
 
 #include <linux/fcntl.h>   // AT_FDCWD, O_DIRECT, O_CREAT, O_RDWR, O_TRUNC
 #include <linux/fs.h>      // RWF_DONTCACHE
-#include <linux/time.h>    // CLOCK_MONOTONIC
+#include <linux/time.h>    // CLOCK_MONOTONIC (constants only)
 #include <linux/fadvise.h> // POSIX_FADV_DONTNEED
 
 // RWF_DONTCACHE: merged in 6.16, flag value 0x80
@@ -44,10 +44,7 @@ static inline int sys_unlinkat(int dirfd, const char *pathname, int flags) {
     return (int)_syscall3(__NR_unlinkat, dirfd, pathname, flags);
 }
 
-static inline int sys_clock_gettime(int clk_id,
-                                     struct __kernel_timespec *tp) {
-    return (int)_syscall2(__NR_clock_gettime, clk_id, tp);
-}
+// sys_clock_gettime moved to nolibc.h
 
 static inline long sys_getrandom(void *buf, size_t buflen,
                                   unsigned int flags) {
