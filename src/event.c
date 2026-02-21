@@ -119,7 +119,7 @@ static struct io_uring_sqe SQE_TEMPLATE_SEND = { // non-const: addr set at init
 CACHE_ALIGN
 static const struct io_uring_sqe SQE_TEMPLATE_CLOSE = {
     .opcode = IORING_OP_CLOSE,
-    .flags  = IOSQE_FIXED_FILE | IOSQE_CQE_SKIP_SUCCESS,
+    .flags  = IOSQE_CQE_SKIP_SUCCESS,
 };
 
 // ZC buffer group ID - distinct from recv buffer group
@@ -157,7 +157,7 @@ CACHE_ALIGN UNUSED
 static const struct io_uring_sqe SQE_TEMPLATE_TIMEOUT = {
     .opcode        = IORING_OP_TIMEOUT,
     .fd            = -1,
-    .len           = 0,
+    .len           = 1,   // count of timespec structs (must be 1, NOT 0)
     .timeout_flags = IORING_TIMEOUT_MULTISHOT,
     .user_data     = OP_TIMEOUT_SHIFTED | 0xFFFFFFFF,
 };
@@ -209,9 +209,8 @@ struct idle_node {
 };
 
 static struct idle_node g_idle_list[MAX_CONNECTIONS];  // 256 KB
-static u32 g_last_activity[MAX_CONNECTIONS];           // 256 KB
-static u64 g_start_sec;                                // CLOCK_MONOTONIC at startup
-static u32 g_cached_now;                               // updated on timer tick only
+static u64 g_last_activity[MAX_CONNECTIONS];           // 512 KB — raw TSC ticks
+static u64 g_idle_timeout_ticks;                       // precomputed IDLE_TIMEOUT_SEC * tsc_freq
 
 // Unlink node from list. Caller must check in_idle first.
 static inline void idle_unlink(u16 idx) {
@@ -222,7 +221,7 @@ static inline void idle_unlink(u16 idx) {
 }
 
 // Move/insert connection to tail (most recent). O(1).
-static inline void idle_touch(u16 idx, u32 now) {
+static inline void idle_touch(u16 idx) {
     struct conn_state *c = &g_conns[idx];
     if (c->in_idle)
         idle_unlink(idx);
@@ -233,7 +232,7 @@ static inline void idle_touch(u16 idx, u32 now) {
     g_idle_list[tail].next = idx;
     g_idle_list[0].prev = idx;
     c->in_idle = 1;
-    g_last_activity[idx] = now;
+    g_last_activity[idx] = rdtsc();
 }
 
 // Remove from list on close. O(1).
@@ -243,6 +242,18 @@ static inline void idle_remove(u16 idx) {
         idle_unlink(idx);
         c->in_idle = 0;
     }
+}
+
+// Re-insert at head (oldest position) with timestamp 0, forcing expiry on
+// next sweep tick. Used to schedule close retry when SQE submission fails.
+static inline void idle_insert_expired(u16 idx) {
+    u16 head = g_idle_list[0].next;
+    g_idle_list[idx].next = head;
+    g_idle_list[idx].prev = 0;
+    g_idle_list[0].next = idx;
+    g_idle_list[head].prev = idx;
+    g_conns[idx].in_idle = 1;
+    g_last_activity[idx] = 0;
 }
 
 // Static value for async setsockopt - must persist across async operation
@@ -277,8 +288,14 @@ static inline bool is_benign_err(int err) {
     PREP_SQE(sqe, SQE_TEMPLATE_SEND, fd, OP_SEND_SHIFTED | (u32)(fd) | ((u64)(buf_idx) << 40)); \
 } while (0)
 
-#define prep_close_direct(sqe, fd) \
-    PREP_SQE(sqe, SQE_TEMPLATE_CLOSE, fd, OP_CLOSE_SHIFTED | (u32)(fd))
+// Scalar prep for close (cold path — connection teardown, not SIMD)
+// Fixed-file close uses file_index (not IOSQE_FIXED_FILE + fd).
+// Kernel convention: file_index = slot + 1 (0 means "regular fd close").
+static inline void prep_close_direct(struct io_uring_sqe *sqe, int fd) {
+    *sqe = SQE_TEMPLATE_CLOSE;
+    sqe->user_data = OP_CLOSE_SHIFTED | (u32)fd;
+    sqe->file_index = (u32)fd + 1;
+}
 
 #define prep_send_zc_direct(sqe, fd, buf_idx) \
     PREP_SQE(sqe, SQE_TEMPLATE_SEND_ZC, fd, OP_SEND_ZC_SHIFTED | (u32)(fd) | ((u64)(buf_idx) << 40))
@@ -323,6 +340,23 @@ static inline void prep_cancel_recv(struct io_uring_sqe *sqe, int fd) {
     *sqe = SQE_TEMPLATE_CANCEL;
     sqe->addr      = OP_RECV_SHIFTED | (u32)fd;
     sqe->user_data = OP_CANCEL_SHIFTED | (u32)fd;
+}
+
+// Detect TSC frequency via CPUID. Called once at startup.
+// Leaf 0x15: exact TSC = crystal_hz * numerator / denominator
+// Leaf 0x16: base frequency in MHz (fallback)
+static u64 detect_tsc_freq(void) {
+    u32 eax, ebx, ecx, edx;
+
+    cpuid(0x15, 0, &eax, &ebx, &ecx, &edx);
+    if (eax && ebx && ecx)
+        return (u64)ecx * ebx / eax;
+
+    cpuid(0x16, 0, &eax, &ebx, &ecx, &edx);
+    if (eax & 0xFFFF)
+        return (u64)(eax & 0xFFFF) * 1000000ULL;
+
+    return 0;
 }
 
 // Listening socket setup (startup path - not performance critical)
@@ -492,7 +526,10 @@ static inline bool queue_close(struct server_ctx *ctx, int fd) {
 force_close:;
     struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
     if (unlikely(!sqe)) {
-        LOG_ERROR("SQ full on close fd=%d", fd);
+        LOG_ERROR("SQ full on close fd=%d, will retry on next sweep", fd);
+        c->closing = 0;
+        c->cancel_sent = 0;
+        idle_insert_expired((u16)fd);
         return false;
     }
     prep_close_direct(sqe, fd);
@@ -574,7 +611,14 @@ static inline void handle_cancel(struct server_ctx *ctx,
     // All results lead to close — the recv is no longer producing CQEs
     struct io_uring_sqe *sqe = uring_get_sqe(&ctx->ring);
     if (unlikely(!sqe)) {
-        LOG_ERROR("SQ full on post-cancel close fd=%d", fd);
+        LOG_ERROR("SQ full on post-cancel close fd=%d, will retry on next sweep", fd);
+        struct conn_state *c = get_conn(fd);
+        if (c) {
+            c->closing = 0;
+            c->cancel_sent = 0;
+            c->recv_active = 0;  // cancel completed, recv is done
+            idle_insert_expired((u16)fd);
+        }
         return;
     }
     prep_close_direct(sqe, fd);
@@ -583,10 +627,10 @@ static inline void handle_cancel(struct server_ctx *ctx,
 // O(k) where k = number of expired connections. Walks LRU list from head
 // (oldest) and stops at first non-expired node.
 static void sweep_idle_connections(struct server_ctx *ctx) {
-    u32 now = g_cached_now;
+    u64 now = rdtsc();
     u16 idx = g_idle_list[0].next;  // head = oldest
     while (idx != 0) {
-        if (now - g_last_activity[idx] < IDLE_TIMEOUT_SEC)
+        if (now - g_last_activity[idx] < g_idle_timeout_ticks)
             break;  // sorted by time — rest are newer
         u16 next = g_idle_list[idx].next;
         queue_close(ctx, (int)idx);
@@ -596,17 +640,15 @@ static void sweep_idle_connections(struct server_ctx *ctx) {
 
 static inline void handle_timeout(struct server_ctx *ctx,
                                     struct io_uring_cqe *cqe) {
-    // Update cached clock (one syscall per tick, not per recv)
-    struct __kernel_timespec ts;
-    sys_clock_gettime(1 /* CLOCK_MONOTONIC */, &ts);
-    g_cached_now = (u32)((u64)ts.tv_sec - g_start_sec);
-
     sweep_idle_connections(ctx);
 
     // IORING_TIMEOUT_MULTISHOT: CQE has MORE flag if still armed
     if (unlikely(!(cqe->flags & IORING_CQE_F_MORE))) {
         LOG_WARN("multishot timeout disarmed, rearming");
-        queue_timeout_sweep(ctx);
+        if (unlikely(!queue_timeout_sweep(ctx))) {
+            LOG_FATAL("Failed to rearm sweep timer");
+            ctx->running = 0;
+        }
     }
 }
 
@@ -620,7 +662,7 @@ static inline void handle_accept(struct server_ctx *ctx, struct io_uring_cqe *cq
             c->recv_active = 0;
             c->cancel_sent = 0;
             c->in_idle = 0;
-            idle_touch((u16)idx, g_cached_now);
+            idle_touch((u16)idx);
 
             // Async TCP_NODELAY via io_uring - kernel resolves fixed file internally
             queue_setsockopt_nodelay(ctx, idx);
@@ -665,7 +707,7 @@ static inline void handle_recv(struct server_ctx *ctx, struct io_uring_cqe *cqe,
         return;
     }
 
-    idle_touch((u16)fd, g_cached_now);
+    idle_touch((u16)fd);
 
     if (unlikely(!(cqe->flags & IORING_CQE_F_BUFFER))) {
         LOG_BUG("no buffer flag fd=%d", fd);
@@ -739,13 +781,18 @@ static void event_loop(struct server_ctx *ctx) {
         return;
     }
 
-    // Initialize idle tracking
-    struct __kernel_timespec init_ts;
-    sys_clock_gettime(1 /* CLOCK_MONOTONIC */, &init_ts);
-    g_start_sec = (u64)init_ts.tv_sec;
-    g_cached_now = 0;
-    mem_zero_aligned(g_last_activity, sizeof(g_last_activity));
-    mem_zero_aligned(g_idle_list, sizeof(g_idle_list));
+    // Detect TSC frequency and precompute idle threshold
+    u64 tsc_freq = detect_tsc_freq();
+    if (unlikely(!tsc_freq)) {
+        LOG_FATAL("CPUID: cannot determine TSC frequency");
+        return;
+    }
+    g_idle_timeout_ticks = (u64)IDLE_TIMEOUT_SEC * tsc_freq;
+
+    // BSS arrays (g_last_activity, g_idle_list, g_conns) are zero-initialized
+    // by the kernel's ELF loader — no explicit zero needed.  Avoiding
+    // mem_zero_aligned keeps pages demand-faulted (RSS proportional to
+    // active connections, not MAX_CONNECTIONS).
     // Sentinel (idx 0) is zero-initialized: prev=0, next=0 = empty circular list
 
     if (unlikely(!queue_timeout_sweep(ctx))) {
@@ -882,8 +929,6 @@ int server_run(u16 port, int cpu) {
 
     struct server_ctx ctx = { .running = 1 };
     g_ctx = &ctx;
-
-    mem_zero_aligned(g_conns, sizeof(g_conns));
 
     if (k_sigaction(SIGINT, signal_handler) < 0)
         LOG_WARN("sigaction(SIGINT) failed");

@@ -169,6 +169,20 @@ static inline int sys_clock_gettime(int clk_id,
     return (int)_syscall2(__NR_clock_gettime, clk_id, tp);
 }
 
+// x86-64 timestamp counter — ~20 cycles, no kernel transition
+static inline u64 rdtsc(void) {
+    u32 lo, hi;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((u64)hi << 32) | lo;
+}
+
+static inline void cpuid(u32 leaf, u32 subleaf,
+                          u32 *eax, u32 *ebx, u32 *ecx, u32 *edx) {
+    __asm__ volatile ("cpuid"
+        : "=a"(*eax), "=b"(*ebx), "=c"(*ecx), "=d"(*edx)
+        : "a"(leaf), "c"(subleaf));
+}
+
 static inline int sys_rt_sigaction(int sig, const struct k_sigaction *act,
                                     struct k_sigaction *oact, size_t sigsetsize) {
     return (int)_syscall4(__NR_rt_sigaction, sig, act, oact, sigsetsize);
