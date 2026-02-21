@@ -278,6 +278,27 @@ static inline void _fmt_write(int fd, const char *fmt, ...) {
     sys_write(fd, buf, (size_t)pos);
 }
 
+// Compiler compatibility: GCC-specific pragmas that Clang/ICX don't need.
+// GCC converts explicit loops back into memset/memcpy calls (infinite recursion
+// in freestanding); Clang doesn't do this transformation.
+#ifdef __clang__
+#define GCC_PUSH_NO_LOOP_PATTERNS
+#define GCC_POP_OPTIONS
+#else
+#define GCC_PUSH_NO_LOOP_PATTERNS \
+    _Pragma("GCC push_options") \
+    _Pragma("GCC optimize(\"no-tree-loop-distribute-patterns\")")
+#define GCC_POP_OPTIONS _Pragma("GCC pop_options")
+#endif
+
+// externally_visible: GCC-only, prevents LTO from stripping symbols.
+// __attribute__((used)) alone suffices for Clang/ICX.
+#ifdef __clang__
+#define ATTR_EXT_VIS
+#else
+#define ATTR_EXT_VIS , externally_visible
+#endif
+
 // _start entry point (emitted once — guard with NOLIBC_MAIN)
 
 #ifdef NOLIBC_MAIN
@@ -293,10 +314,9 @@ static inline void _fmt_write(int fd, const char *fmt, ...) {
 // Aliasing-safe u64 for memset/memcpy - avoids strict aliasing UB
 typedef u64 __attribute__((may_alias)) u64_alias;
 
-#pragma GCC push_options
-#pragma GCC optimize("no-tree-loop-distribute-patterns")
+GCC_PUSH_NO_LOOP_PATTERNS
 
-__attribute__((noinline, used, externally_visible))
+__attribute__((noinline, used ATTR_EXT_VIS))
 void *memset(void *s, int c, size_t n) {
     u8 *p = (u8 *)s;
     u64_alias fill = (u8)c * 0x0101010101010101ULL;
@@ -305,7 +325,7 @@ void *memset(void *s, int c, size_t n) {
     return s;
 }
 
-__attribute__((noinline, used, externally_visible))
+__attribute__((noinline, used ATTR_EXT_VIS))
 void *memcpy(void *dst, const void *src, size_t n) {
     u8 *d = (u8 *)dst;
     const u8 *s = (const u8 *)src;
@@ -314,12 +334,12 @@ void *memcpy(void *dst, const void *src, size_t n) {
     return dst;
 }
 
-#pragma GCC pop_options
+GCC_POP_OPTIONS
 
-__attribute__((externally_visible, used))
+__attribute__((used ATTR_EXT_VIS))
 int main(int argc, char *argv[]);
 
-__attribute__((naked, noreturn, used, externally_visible))
+__attribute__((naked, noreturn, used ATTR_EXT_VIS))
 void _start(void) {
     __asm__ volatile (
         "xor  %%ebp, %%ebp\n\t"       /* ABI: clear frame pointer */

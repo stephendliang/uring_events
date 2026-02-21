@@ -16,8 +16,7 @@
 #define _MM_MALLOC_H_INCLUDED
 #include <immintrin.h>
 
-#pragma GCC push_options
-#pragma GCC optimize("no-tree-loop-distribute-patterns")
+GCC_PUSH_NO_LOOP_PATTERNS
 
 static inline void mem_zero_aligned(void *dst, u64 n) {
     __m512i zero = _mm512_setzero_si512();
@@ -99,15 +98,14 @@ static inline void mem_iota_u32(u32 *dst, u32 n) {
     }
 }
 
-#pragma GCC pop_options
+GCC_POP_OPTIONS
 
 #elif defined(__AVX2__)
 // AVX2: two 32-byte stores per cache line
 #define _MM_MALLOC_H_INCLUDED
 #include <immintrin.h>
 
-#pragma GCC push_options
-#pragma GCC optimize("no-tree-loop-distribute-patterns")
+GCC_PUSH_NO_LOOP_PATTERNS
 
 static inline void mem_zero_aligned(void *dst, u64 n) {
     __m256i zero = _mm256_setzero_si256();
@@ -198,14 +196,13 @@ static inline void mem_iota_u32(u32 *dst, u32 n) {
     }
 }
 
-#pragma GCC pop_options
+GCC_POP_OPTIONS
 
 #else
 // Scalar: explicit loops — __builtin_memset/memcpy emit glibc calls
 // for sizes > ~512B. The pragma prevents GCC from converting loops back.
 
-#pragma GCC push_options
-#pragma GCC optimize("no-tree-loop-distribute-patterns")
+GCC_PUSH_NO_LOOP_PATTERNS
 
 static inline void mem_zero_aligned(void *dst, u64 n) {
     u8 *p = (u8 *)dst;
@@ -252,7 +249,7 @@ static inline void mem_iota_u32(u32 *dst, u32 n) {
         dst[i] = i;
 }
 
-#pragma GCC pop_options
+GCC_POP_OPTIONS
 
 #endif
 
@@ -261,8 +258,7 @@ typedef u64 __attribute__((aligned(1))) u64_ua;
 
 // Byte-granular copy for arbitrary sizes (e.g., ZC send path).
 // Not aligned, not SIMD — for small copies only (<4KB).
-#pragma GCC push_options
-#pragma GCC optimize("no-tree-loop-distribute-patterns")
+GCC_PUSH_NO_LOOP_PATTERNS
 static inline void mem_copy_small(void *restrict dst,
                                    const void *restrict src, u32 n) {
     u8 *d = (u8 *)dst;
@@ -270,4 +266,4 @@ static inline void mem_copy_small(void *restrict dst,
     while (n >= 8) { *(u64_ua *)d = *(const u64_ua *)s; d += 8; s += 8; n -= 8; }
     while (n--) *d++ = *s++;
 }
-#pragma GCC pop_options
+GCC_POP_OPTIONS

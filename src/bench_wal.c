@@ -537,7 +537,6 @@ int oltp_run(const struct oltp_config *cfg, struct oltp_result *res) {
     u32 reads_completed = 0;
     u32 read_errors = 0;
     u32 wal_errors = 0;
-    u32 reads_submitted = 0;
     u32 reads_since_commit = 0;
     u32 wal_writes_pending = 0;
     u64 group_start_ns = 0;
@@ -554,7 +553,6 @@ int oltp_run(const struct oltp_config *cfg, struct oltp_result *res) {
         void *buf = read_buf + (size_t)slot * cfg->page_size;
         wal_prep_read(sqe, data_fd, buf, cfg->page_size, off,
                       WAL_ENCODE_UD(WAL_OP_READ, slot), rw_flags);
-        reads_submitted++;
     }
 
     // Main loop
@@ -596,7 +594,7 @@ int oltp_run(const struct oltp_config *cfg, struct oltp_result *res) {
                         wal_prep_read(sqe, data_fd, buf, cfg->page_size, off,
                                       WAL_ENCODE_UD(WAL_OP_READ, slot),
                                       rw_flags);
-                        reads_submitted++;
+
                     }
                 }
 

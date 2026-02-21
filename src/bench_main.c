@@ -4,6 +4,7 @@
 #include "bench.h"
 #include "bench_wal.h"
 #include "bench_syscalls.h"
+#include "bench_stats.h"
 
 // String comparison — byte-by-byte, no libc.
 static inline int str_eq(const char *a, const char *b) {
@@ -119,7 +120,11 @@ static void usage(void) {
     _fmt_write(2, "OLTP mixed:\n");
     _fmt_write(2, "  bench oltp [rqd] [gs] [rs] [mode] [groups] [rpc] [dmb] [wmb] [cpu] [dpath] [wpath]\n");
     _fmt_write(2, "    rqd:    read queue depth 1-4096 (default: 32)\n");
-    _fmt_write(2, "    rpc:    reads per commit 1-1000 (default: 32)\n");
+    _fmt_write(2, "    rpc:    reads per commit 1-1000 (default: 32)\n\n");
+    _fmt_write(2, "  bench oltp-sweep [runs] [cpu] [data_path] [wal_path]\n");
+    _fmt_write(2, "    runs:   3-30 measured runs per config (default: 20)\n");
+    _fmt_write(2, "    Sweeps rpc={1,2,4,8,16,32,64,128} x gs={1,4} x {buffered,direct}\n");
+    _fmt_write(2, "    32 configs, 2 warmup + N measured runs each, CSV on stdout\n");
 }
 
 // Run buffered vs O_DIRECT sweep across block sizes.
@@ -432,6 +437,187 @@ static void print_oltp_result(const struct oltp_config *cfg,
     _fmt_write(1, "Total: %lu ms\n", res->total_ns / 1000000);
 }
 
+// --- OLTP sweep ---
+
+#define SWEEP_MAX_RUNS 30
+
+static int run_oltp_sweep(u32 num_runs, int cpu,
+                           const char *data_path, const char *wal_path) {
+    static const u32 rpc_vals[] = { 1, 2, 4, 8, 16, 32, 64, 128 };
+    static const u32 gs_vals[] = { 1, 4 };
+    static const enum io_mode mode_vals[] = { IO_BUFFERED, IO_DIRECT };
+
+    u32 num_rpc = 8, num_gs = 2, num_modes = 2;
+    u32 total_configs = num_rpc * num_gs * num_modes;  // 32
+    u32 warmup_runs = 2;
+
+    // Metric arrays for CI computation
+    u64 commits_sec[SWEEP_MAX_RUNS];
+    u64 txns_sec[SWEEP_MAX_RUNS];
+    u64 sync_p50[SWEEP_MAX_RUNS];
+    u64 sync_p99[SWEEP_MAX_RUNS];
+    u64 grp_p50[SWEEP_MAX_RUNS];
+    u64 grp_p99[SWEEP_MAX_RUNS];
+    u64 read_iops[SWEEP_MAX_RUNS];
+    u64 read_p50[SWEEP_MAX_RUNS];
+
+    // CSV header
+    _fmt_write(1, "rpc,gs,mode,n,commits_mean,commits_ci,");
+    _fmt_write(1, "txns_mean,txns_ci,");
+    _fmt_write(1, "sync_p50_us,sync_p50_ci,sync_p99_us,sync_p99_ci,");
+    _fmt_write(1, "grp_p50_us,grp_p50_ci,grp_p99_us,grp_p99_ci,");
+    _fmt_write(1, "read_iops_mean,read_iops_ci,read_p50_us,read_p50_ci\n");
+
+    u32 config_num = 0;
+
+    for (u32 ri = 0; ri < num_rpc; ri++) {
+        for (u32 gi = 0; gi < num_gs; gi++) {
+            for (u32 mi = 0; mi < num_modes; mi++) {
+                config_num++;
+                const char *mname = mi == 0 ? "buffered" : "direct";
+
+                // Warmup runs
+                for (u32 w = 0; w < warmup_runs; w++) {
+                    _fmt_write(2, "[%u/%u] rpc=%u gs=%u %s: warmup %u/%u...\n",
+                               config_num, total_configs,
+                               rpc_vals[ri], gs_vals[gi], mname,
+                               w + 1, warmup_runs);
+
+                    struct oltp_config cfg = {
+                        .mode = mode_vals[mi],
+                        .read_qd = 32,
+                        .group_size = gs_vals[gi],
+                        .record_size = 512,
+                        .page_size = 4096,
+                        .num_groups = 5000,
+                        .reads_per_commit = rpc_vals[ri],
+                        .data_file_mb = 2048,
+                        .wal_file_mb = 0,
+                        .cpu = cpu,
+                        .data_path = data_path,
+                        .wal_path = wal_path,
+                    };
+                    struct oltp_result res = {0};
+                    int ret = oltp_run(&cfg, &res);
+                    if (ret < 0) {
+                        _fmt_write(2, "  [ERROR] warmup failed: %d\n", ret);
+                        goto next_config;
+                    }
+                }
+
+                // Measured runs
+                u32 good_runs = 0;
+                for (u32 r = 0; r < num_runs; r++) {
+                    struct oltp_config cfg = {
+                        .mode = mode_vals[mi],
+                        .read_qd = 32,
+                        .group_size = gs_vals[gi],
+                        .record_size = 512,
+                        .page_size = 4096,
+                        .num_groups = 5000,
+                        .reads_per_commit = rpc_vals[ri],
+                        .data_file_mb = 2048,
+                        .wal_file_mb = 0,
+                        .cpu = cpu,
+                        .data_path = data_path,
+                        .wal_path = wal_path,
+                    };
+                    struct oltp_result res = {0};
+                    int ret = oltp_run(&cfg, &res);
+                    if (ret < 0) {
+                        _fmt_write(2, "  [ERROR] run %u/%u failed: %d\n",
+                                   r + 1, num_runs, ret);
+                        continue;
+                    }
+
+                    commits_sec[good_runs] = res.commits_per_sec;
+                    txns_sec[good_runs] = res.txns_per_sec;
+                    sync_p50[good_runs] = res.sync_lat_p50_ns;
+                    sync_p99[good_runs] = res.sync_lat_p99_ns;
+                    grp_p50[good_runs] = res.group_lat_p50_ns;
+                    grp_p99[good_runs] = res.group_lat_p99_ns;
+                    read_iops[good_runs] = res.read_iops;
+                    read_p50[good_runs] = res.read_lat_p50_ns;
+                    good_runs++;
+
+                    _fmt_write(2, "[%u/%u] rpc=%u gs=%u %s: run %u/%u "
+                               "commits=%lu sync_p50=%luus\n",
+                               config_num, total_configs,
+                               rpc_vals[ri], gs_vals[gi], mname,
+                               r + 1, num_runs,
+                               res.commits_per_sec,
+                               res.sync_lat_p50_ns / 1000);
+                }
+
+                if (good_runs < 3) {
+                    _fmt_write(2, "[%u/%u] rpc=%u gs=%u %s: "
+                               "SKIP (only %u good runs)\n",
+                               config_num, total_configs,
+                               rpc_vals[ri], gs_vals[gi], mname, good_runs);
+                    goto next_config;
+                }
+
+                // Compute CIs
+                struct bench_ci ci_commits, ci_txns;
+                struct bench_ci ci_sync_p50, ci_sync_p99;
+                struct bench_ci ci_grp_p50, ci_grp_p99;
+                struct bench_ci ci_read_iops, ci_read_p50;
+
+                bench_compute_ci(commits_sec, good_runs, &ci_commits);
+                bench_compute_ci(txns_sec, good_runs, &ci_txns);
+                bench_compute_ci(sync_p50, good_runs, &ci_sync_p50);
+                bench_compute_ci(sync_p99, good_runs, &ci_sync_p99);
+                bench_compute_ci(grp_p50, good_runs, &ci_grp_p50);
+                bench_compute_ci(grp_p99, good_runs, &ci_grp_p99);
+                bench_compute_ci(read_iops, good_runs, &ci_read_iops);
+                bench_compute_ci(read_p50, good_runs, &ci_read_p50);
+
+                // CSV row
+                _fmt_write(1, "%u,%u,%s,%u,",
+                           rpc_vals[ri], gs_vals[gi], mname, good_runs);
+                _fmt_write(1, "%lu,%lu,",
+                           ci_commits.mean, ci_commits.ci_half);
+                _fmt_write(1, "%lu,%lu,",
+                           ci_txns.mean, ci_txns.ci_half);
+                _fmt_write(1, "%lu,%lu,%lu,%lu,",
+                           ci_sync_p50.mean / 1000,
+                           ci_sync_p50.ci_half / 1000,
+                           ci_sync_p99.mean / 1000,
+                           ci_sync_p99.ci_half / 1000);
+                _fmt_write(1, "%lu,%lu,%lu,%lu,",
+                           ci_grp_p50.mean / 1000,
+                           ci_grp_p50.ci_half / 1000,
+                           ci_grp_p99.mean / 1000,
+                           ci_grp_p99.ci_half / 1000);
+                _fmt_write(1, "%lu,%lu,%lu,%lu\n",
+                           ci_read_iops.mean, ci_read_iops.ci_half,
+                           ci_read_p50.mean / 1000,
+                           ci_read_p50.ci_half / 1000);
+
+                // Summary on stderr
+                _fmt_write(2, "[%u/%u] rpc=%u gs=%u %s: DONE "
+                           "commits=%lu+/-%lu (%u.%u%%) "
+                           "sync_p50=%lu+/-%luus (%u.%u%%)\n",
+                           config_num, total_configs,
+                           rpc_vals[ri], gs_vals[gi], mname,
+                           ci_commits.mean, ci_commits.ci_half,
+                           ci_commits.ci_pct_x10 / 10,
+                           ci_commits.ci_pct_x10 % 10,
+                           ci_sync_p50.mean / 1000,
+                           ci_sync_p50.ci_half / 1000,
+                           ci_sync_p50.ci_pct_x10 / 10,
+                           ci_sync_p50.ci_pct_x10 % 10);
+
+            next_config:
+                (void)0;
+            }
+        }
+    }
+
+    _fmt_write(2, "\nDone: %u configs\n", total_configs);
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         usage();
@@ -606,6 +792,26 @@ int main(int argc, char *argv[]) {
         }
         print_oltp_result(&cfg, &res);
         return 0;
+    }
+
+    // OLTP sweep
+    if (str_eq(argv[1], "oltp-sweep")) {
+        u32 runs = 20;
+        int cpu = 0;
+        const char *data_path = "/tmp/uring_bench_data.dat";
+        const char *wal_path = "/tmp/uring_bench_wal.dat";
+        if (argc > 2) {
+            int r = parse_int(argv[2], 3, 30, "runs");
+            if (r < 0) return 1;
+            runs = (u32)r;
+        }
+        if (argc > 3) {
+            cpu = parse_int(argv[3], 0, 1023, "cpu");
+            if (cpu < 0) return 1;
+        }
+        if (argc > 4) data_path = argv[4];
+        if (argc > 5) wal_path = argv[5];
+        return run_oltp_sweep(runs, cpu, data_path, wal_path);
     }
 
     if (argc < 3) {
