@@ -1,7 +1,7 @@
 # Multicore Scaling: raw clone() threads with io_uring
 
 **Date**: 2026-02-21
-**Commit**: faa3ee1
+**Commit**: d7fe661
 
 ## Design
 

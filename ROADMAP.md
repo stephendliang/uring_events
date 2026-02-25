@@ -1,7 +1,7 @@
 # Roadmap
 
 Current state: single-threaded io_uring HTTP server, freestanding 26KB binary,
-static "OK" response. See [prompt.md](prompt.md) for architecture.
+static "OK" response. See [CLAUDE.md](CLAUDE.md) for architecture.
 
 ## Done
 
@@ -12,7 +12,7 @@ static "OK" response. See [prompt.md](prompt.md) for architecture.
 - Stride-2 CPU assignment skips HT siblings (one worker per physical core)
 - Futex-based join (CLONE_CHILD_CLEARTID)
 - `#ifdef MULTICORE` — default build unchanged
-- See [docs/2026-02-21-multicore.md](docs/2026-02-21-multicore.md)
+- See [docs/multicore.md](docs/multicore.md)
 
 ## Planned
 
