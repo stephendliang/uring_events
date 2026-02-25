@@ -19,6 +19,15 @@ Single-threaded or multicore (`#ifdef MULTICORE`) via raw `clone()` — shared-n
 | `src/sqe_avx512.h` | `PREP_SQE` via single `_mm512_store_si512` + masked set |
 | `src/sqe_avx2.h` | `PREP_SQE` via two `_mm256_store_si256` + blend |
 | `src/sqe_scalar.h` | `PREP_SQE` via struct copy + field patches |
+| `src/bench_main.c` | Bench entry point, CLI parsing, 7 modes, result formatting |
+| `src/bench.c` | Disk I/O engine: slot-based I/O loop, file setup, stats |
+| `src/bench_wal.c` | WAL group commit (`wal_run`) and OLTP mixed (`oltp_run`) |
+| `src/bench_conn.c` | Standalone idle-tracking microbenchmark (sieve/linear/wheel) |
+| `src/bench.h` | Bench config/result structs, enums (io_mode, access_pattern, io_direction) |
+| `src/bench_wal.h` | WAL/OLTP config/result structs, WAL user_data encoding |
+| `src/bench_sqe.h` | Scalar SQE prep for bench (BENCH_ENCODE_UD, read/write/fsync) |
+| `src/bench_stats.h` | Timing (clock_gettime), shell sort, percentiles, CI computation |
+| `src/bench_syscalls.h` | File I/O syscalls (openat, fallocate, fadvise64, getrandom, ...) |
 
 ```
 main.c  ─→ event.h ─→ event.c ─→ uring.h (inline hot path)
@@ -40,6 +49,10 @@ make debug              # -O0 -g -DDEBUG (enables LOG_INFO/WARN/ERROR/BUG)
 make release-multicore  # -DMULTICORE → shared-nothing multi-worker
 make debug-multicore    # multicore + debug logging
 make release-file-io    # -DFILE_IO → file read/write/fdatasync ops
+make bench              # -O3 -march=native → ./bench (disk I/O benchmark)
+make bench-debug        # -O0 -g -DDEBUG → ./bench-debug
+make bench-icx          # Intel ICX compiler → ./bench-icx
+make bench-conn         # standalone idle-tracking microbenchmark → ./bench-conn
 make clean
 ```
 
@@ -124,6 +137,8 @@ N workers via raw `clone()` syscall 56 (asm trampoline in `nolibc.h`). Each work
 
 | File | Content |
 |------|---------|
+| `docs/server.md` | Deep server architecture reference (io_uring setup, event loop, etc.) |
+| `docs/bench.md` | Bench suite architecture (build, usage, 7 CLI modes, internals) |
 | `docs/benchmarks.md` | Benchmark history: VPS, workstation (isolcpus), nginx comparison |
 | `docs/multicore.md` | Multicore design + localhost/LAN benchmarks |
 | `docs/zerocopy.md` | Why SEND_ZC is a net loss for small responses |
