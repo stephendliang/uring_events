@@ -77,7 +77,7 @@ enum {
 
 // Ring structures - cache-line optimized layout
 struct uring_sq {
-    // === First cache line (64 bytes): Hot path ===
+    // First cache line (64 bytes): Hot path
     u32 *khead;                     // +0:  Consumer head (kernel updates)
     u32 *ktail;                     // +8:  Producer tail (we update)
     struct io_uring_sqe *sqes;      // +16: SQE array
@@ -90,7 +90,7 @@ struct uring_sq {
     u32 _pad0;                      // +52: Explicit padding
     u32 *kflags;                    // +56: Moved to first cache line
 
-    // === Second cache line: Cold ===
+    // Second cache line: Cold
     u32 *kdropped;                  // +64
     u32 *kring_mask;                // +72
     u32 *kring_entries;             // +80
@@ -100,14 +100,14 @@ struct uring_sq {
 // Total: 104 bytes (hole explicit, kflags moved to first cache line)
 
 struct uring_cq {
-    // === Hot path (first 32 bytes) ===
+    // Hot path (first 32 bytes)
     u32 *khead;                     // +0:  Updated every CQ drain
     u32 *ktail;                     // +8:  Loaded every loop
     struct io_uring_cqe *cqes;      // +16: Indexed every CQE
     u32 ring_mask;                  // +24: Used every CQE index
     u32 _pad0;                      // +28: Explicit padding
 
-    // === Cold init-time (remaining 48 bytes) ===
+    // Cold init-time (remaining 48 bytes)
     u32 *kring_mask;                // +32
     u32 *kring_entries;             // +40
     u32 *kflags;                    // +48
@@ -144,21 +144,21 @@ struct buf_ring_config {
 // Layout optimized for cache behavior: hot fields first, cold fields last
 // Aggressively shrunk: bgid derived from index, num_buffers from mask+1, is_zc from bitmap
 struct buf_ring_group {
-    // === Hot path (first 8 bytes) ===
+    // Hot path (first 8 bytes)
     u16 tail;              // +0:  Updated every recycle
     u16 mask;              // +2:  Read every recycle (num_buffers = mask + 1)
     u16 free_count;        // +4:  ZC: updated per alloc/free
     u16 free_summary;      // +6:  ZC: bitmap summary
 
-    // === Address calculation (next 8 bytes) ===
+    // Address calculation (next 8 bytes)
     u32 buffer_shift;      // +8:  HOT: used in BUF_RING_ADDR
     u32 buffer_size;       // +12: WARM: occasional reads
 
-    // === Cold offsets (next 8 bytes) ===
+    // Cold offsets (next 8 bytes)
     u32 ring_offset;       // +16: Init-time only
     u32 data_offset;       // +20: Init-time only
 
-    // === Pointer (final 8 bytes) ===
+    // Pointer (final 8 bytes)
     u64 *free_bitmap;      // +24: ZC only (NULL = not ZC)
 };
 // Total: 32 bytes (fits in half cache line)
