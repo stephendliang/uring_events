@@ -1,9 +1,9 @@
 #!/bin/bash
 # Benchmark script for io_uring HTTP server using wrk
 #
-# Usage: ./bench_nginx.sh [url] [threads] [connections] [duration]
-#        ./bench_nginx.sh                          # defaults: localhost:8080, 2 threads, 100 conns, 20s
-#        ./bench_nginx.sh http://127.0.0.1:8080/ 2 500 20s
+# Usage: ./bench.sh [url] [threads] [connections] [duration]
+#        ./bench.sh                          # defaults: localhost:8080, 2 threads, 100 conns, 20s
+#        ./bench.sh http://127.0.0.1:8080/ 2 500 20s
 
 URL="${1:-http://127.0.0.1:8080/}"
 THREADS="${2:-2}"

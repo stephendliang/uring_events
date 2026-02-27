@@ -2,6 +2,8 @@ event
 event-debug
 bench
 bench-debug
+bench-conn
+bench-icx
 .claude/
 build/
 *.o

@@ -18,7 +18,7 @@ CFLAGS_DEBUG := $(CFLAGS_COMMON) -O0 -g -DDEBUG
 
 BENCH_SRC    := src/bench_main.c src/bench.c src/bench_wal.c src/uring.c
 
-.PHONY: release debug release-file-io debug-file-io release-multicore debug-multicore bench bench-debug bench-icx clean
+.PHONY: release debug release-file-io debug-file-io release-multicore debug-multicore bench bench-debug bench-icx bench-conn clean
 
 release: $(BINARY)
 
@@ -53,5 +53,8 @@ bench-debug:
 bench-icx:
 	icx $(CFLAGS_RELEASE) $(BENCH_SRC) -o bench-icx
 
+bench-conn:
+	$(CC) $(CFLAGS_RELEASE) src/bench_conn.c -o bench-conn
+
 clean:
-	rm -f $(BINARY) $(BINARY_DEBUG) bench bench-debug bench-icx
+	rm -f $(BINARY) $(BINARY_DEBUG) bench bench-debug bench-icx bench-conn
