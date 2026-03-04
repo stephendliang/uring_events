@@ -132,7 +132,7 @@ timeout → sweep_idle_connections (LRU walk)
 
 ## SQE Templates
 
-`src/sqe_avx512.h`, `src/sqe_avx2.h`, `src/sqe_scalar.h` — compile-time selected via `#if defined(__AVX512F__)`.
+`src/sqe.h` — three tiers in one file, compile-time selected via `#if defined(__AVX512F__)` / `#elif defined(__AVX2__)` / `#else`.
 
 Each SQE is 64 bytes (one cache line). Templates are `static const` (or `static` for non-const send templates that need runtime address patching), 64-byte aligned. They contain pre-filled opcodes, flags, ioprio, and other constant fields.
 

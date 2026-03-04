@@ -10,14 +10,8 @@
 #include "event.h"
 #include "util.h"
 
-// SIMD infrastructure for SQE template copy
-#if defined(__AVX512F__)
-#include "sqe_avx512.h"
-#elif defined(__AVX2__)
-#include "sqe_avx2.h"
-#else
-#include "sqe_scalar.h"
-#endif
+// SIMD infrastructure for SQE template copy (AVX-512 > AVX2 > scalar)
+#include "sqe.h"
 
 // Configuration - All tunable at compile time
 enum {
