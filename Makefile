@@ -18,7 +18,7 @@ CFLAGS_DEBUG := $(CFLAGS_COMMON) -O0 -g -DDEBUG
 
 BENCH_SRC    := src/bench_main.c src/bench.c src/bench_wal.c src/uring.c
 
-.PHONY: release debug release-file-io debug-file-io release-multicore debug-multicore bench bench-debug bench-icx bench-conn clean
+.PHONY: release debug release-file-io debug-file-io release-multicore debug-multicore bench bench-debug bench-icx bench-conn dns-test dns-test-debug clean
 
 release: $(BINARY)
 
@@ -56,5 +56,11 @@ bench-icx:
 bench-conn:
 	$(CC) $(CFLAGS_RELEASE) src/bench_conn.c -o bench-conn
 
+dns-test:
+	$(CC) $(CFLAGS_RELEASE) src/dns_test.c -o dns-test
+
+dns-test-debug:
+	$(CC) $(CFLAGS_DEBUG) src/dns_test.c -o dns-test-debug
+
 clean:
-	rm -f $(BINARY) $(BINARY_DEBUG) bench bench-debug bench-icx bench-conn
+	rm -f $(BINARY) $(BINARY_DEBUG) bench bench-debug bench-icx bench-conn dns-test dns-test-debug

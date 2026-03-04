@@ -49,6 +49,7 @@ struct k_sigaction {
 
 #define AF_INET       2
 #define SOCK_STREAM   1
+#define SOCK_DGRAM    2
 #define SOCK_NONBLOCK 0x800
 
 struct sockaddr {
@@ -142,6 +143,10 @@ static inline int sys_bind(int fd, const void *addr, int addrlen) {
 
 static inline int sys_listen(int fd, int backlog) {
     return (int)_syscall2(__NR_listen, fd, backlog);
+}
+
+static inline int sys_connect(int fd, const void *addr, int addrlen) {
+    return (int)_syscall3(__NR_connect, fd, addr, addrlen);
 }
 
 static inline int sys_sched_setaffinity(int pid, size_t len, const void *mask) {
